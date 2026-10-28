@@ -1,0 +1,28 @@
+1 ICON "icon_idle.ico"
+2 ICON "icon_active.ico"
+1 24 "manifest.xml"
+
+1 VERSIONINFO
+FILEVERSION 4,0,0,0
+PRODUCTVERSION 4,0,0,0
+FILEOS 0x40004
+FILETYPE 0x1
+BEGIN
+  BLOCK "StringFileInfo"
+  BEGIN
+    BLOCK "080404B0"
+    BEGIN
+      VALUE "CompanyName", "AgentKeepAwake"
+      VALUE "FileDescription", "AgentKeepAwake - keep agent tasks running while the display is off"
+      VALUE "FileVersion", "4.0.0.0"
+      VALUE "InternalName", "AgentKeepAwake4"
+      VALUE "OriginalFilename", "AgentKeepAwake4.exe"
+      VALUE "ProductName", "AgentKeepAwake"
+      VALUE "ProductVersion", "4.0.0.0"
+    END
+  END
+  BLOCK "VarFileInfo"
+  BEGIN
+    VALUE "Translation", 0x804, 1200
+  END
+END

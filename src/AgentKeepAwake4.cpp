@@ -1,0 +1,1863 @@
+/* ============================================================================
+ * AgentKeepAwake v4 —— 黑屏守护（液态玻璃 UI）
+ * ============================================================================
+ *
+ * 目标：让 Trae / WorkBuddy / Qoder / DeepSeek 等 agent 继续跑，
+ *       同时把显示器关掉（保护屏幕，避免长时间亮屏烧屏/耗电）。
+ *
+ * 做的事只有两件（可通过界面与日志核对）：
+ *   1. 守护线程持有 SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED)
+ *      —— 只阻止系统睡眠/休眠；线程级请求，不挂起、不限速任何进程。
+ *   2. PostMessage(HWND_BROADCAST, WM_SYSCOMMAND, SC_MONITORPOWER, 2)
+ *      —— 只关显示输出；CPU / 内存 / 磁盘 / 网络 / 进程调度完全不受影响。
+ *
+ * 唤醒：鼠标/键盘点亮显示器是硬件级行为，用户态拦不住；本程序在“无操作 N 秒”
+ *       后自动重新关屏（默认 15 秒，可切 关/5/15/30）。你连续操作时不会打断你。
+ *
+ * UI：无边框异形窗口 + 逐像素 alpha + 桌面毛玻璃底 + 半透明玻璃卡片 + 动效，
+ *     全部由 GDI+ 自绘；无任何第三方运行时。
+ *
+ * 构建（TDM-GCC / MinGW-w64 已验证）：
+ *   windres res.rc -o res.o
+ *   g++ -municode -mwindows -O2 -s AgentKeepAwake4.cpp res.o \
+ *       -o AgentKeepAwake4.exe -lgdiplus -lgdi32 -luser32 -lshell32 -ladvapi32
+ * ==========================================================================*/
+
+#define WIN32_LEAN_AND_MEAN
+#ifndef UNICODE
+#define UNICODE
+#endif
+#ifndef _UNICODE
+#define _UNICODE
+#endif
+/* 必须早于 windows.h：不声明目标版本时 MinGW 会让 GetTickCount64 隐式返回 int */
+#ifndef _WIN32_WINNT
+#define _WIN32_WINNT 0x0601
+#endif
+
+#include <windows.h>
+#include <windowsx.h>
+#include <objidl.h>
+#include <shellapi.h>
+#include <tlhelp32.h>
+#include <gdiplus.h>
+#include <math.h>
+#include <stdlib.h>
+#include <stdarg.h>
+#include <stdio.h>
+#include <string.h>
+#include <wchar.h>
+
+using namespace Gdiplus;
+
+/* ---------------------------------------------------------------- 基本常量 */
+#define APP_CLASS    L"AgentKeepAwakeGlassWnd"
+#define APP_TITLE    L"AgentKeepAwake · 黑屏守护"
+#define APP_NAME     L"AgentKeepAwake"
+#define APP_VER      L"v4.0"
+
+#define WM_TRAY      (WM_USER + 10)
+
+#define TIMER_UI     1
+#define TIMER_CLOCK  2
+#define TIMER_SCAN   3
+#define TIMER_MON    4     /* 关屏/亮屏指令的确认与回退 */
+
+/* Agent 名单容量：最多 24 条，界面同时显示 8 个 */
+#define AGENT_MAX    24
+#define AGENT_KEYS   4
+#define AGENT_CHIPS  8
+
+/* 逻辑像素（96 DPI 下的设计稿），运行时按 DPI 缩放 */
+#define PANEL_W      520
+#define PANEL_H      610
+#define SHADOW_M     30      /* 四周留给投影的透明边距 */
+#define PAD          22
+
+#define SCALE(x)     MulDiv((x), (int)g_dpi, 96)
+
+/* 电源请求标志 */
+#ifndef ES_CONTINUOUS
+#define ES_CONTINUOUS       0x80000000
+#endif
+#ifndef ES_SYSTEM_REQUIRED
+#define ES_SYSTEM_REQUIRED  0x00000001
+#endif
+
+#define AKA_DEVICE_NOTIFY_WINDOW_HANDLE 0x00000000
+
+/* GUID_CONSOLE_DISPLAY_STATE —— 显示器 开/关/变暗 的系统通知 */
+static const GUID GUID_DISPLAY_STATE =
+    { 0x6FE69556, 0x704A, 0x47A0,
+      { 0x8F, 0x24, 0xC2, 0x8D, 0x93, 0x6F, 0xDA, 0x47 } };
+
+typedef struct {
+    GUID  PowerSetting;
+    DWORD DataLength;
+    UCHAR Data[1];
+} PBS_AKA;
+
+typedef HANDLE (WINAPI *PFN_RegPowerNotify)(HANDLE, LPCGUID, DWORD);
+typedef BOOL   (WINAPI *PFN_UnregPowerNotify)(HANDLE);
+
+/* ---------------------------------------------------------------- 配色 */
+static const Color C_TXT      (255, 244, 247, 252);
+static const Color C_TXT2     (255, 170, 180, 196);
+static const Color C_TXT3     (255, 124, 135, 152);
+static const Color C_TXT4     (255,  96, 106, 122);
+static const Color C_MINT     (255,  94, 226, 197);
+static const Color C_BLUE     (255,  98, 142, 255);
+static const Color C_ROSE     (255, 255, 126, 130);
+static const Color C_DARKTXT  (255,   6,  26,  30);
+static const Color C_GRAYDOT  (255,  92, 100, 114);
+
+/* ---------------------------------------------------------------- 按钮 ID */
+enum {
+    B_NONE = -1,
+    B_MAIN = 0,
+    B_MIN,
+    B_CLOSE,
+    B_EXIT,
+    B_RB0, B_RB1, B_RB2, B_RB3,
+    B_MD0, B_MD1,
+    B_COUNT
+};
+
+/* ---------------------------------------------------------------- 全局 */
+static HINSTANCE   g_inst;
+static HWND        g_hwnd;
+static HDC         g_memDC;
+static HBITMAP     g_memBmp;
+static void       *g_memBits;
+static Bitmap     *g_canvas;
+static Bitmap     *g_backdrop;
+static Bitmap     *g_glass;
+static int         g_cw, g_ch;         /* 画布像素尺寸（含投影边距） */
+static UINT        g_dpi = 96;
+static ULONG_PTR   g_gdipToken;
+static BOOL        g_quit;
+
+/* 字体 */
+static Font *fName, *fSub, *fStatus, *fStatusSub, *fMetricL, *fMetricV,
+            *fBtn, *fPill, *fPillOn, *fChip, *fCardTitle, *fFoot, *fHint;
+
+/* 布局（像素，面板坐标系） */
+static RectF rPanel, rHero, rMain, rBtnMin, rBtnClose, rBtnExit,
+             rAgents, rSettings, rRb[4], rMd[2], rChip[AGENT_CHIPS], rSettingsRow1,
+             rSettingsRow2, rAgentHint, rAgentsFoot;
+
+/* 交互 */
+static int   g_hoverId = B_NONE;
+static int   g_downId  = B_NONE;
+static float g_hover[B_COUNT];
+static float g_press[B_COUNT];
+static BOOL  g_tracking;
+
+/* 运行状态 */
+static volatile LONG g_mode;           /* 0=关 1=防睡+黑屏 2=仅防睡 */
+static int   g_prefMode = 1;           /* 下次启动用哪种模式 */
+static volatile LONG g_screenOff;
+static DWORD g_lastDispState = 1;      /* 系统通知的真实状态: 0关 1开 2变暗 */
+static DWORD g_monWant = 1;            /* 最近一次指令: 0=关 1=开 */
+static DWORD g_monAt;                  /* 指令发出时刻 */
+static BOOL  g_monConfirmed;           /* 本次指令是否已被系统通知证实 */
+static int   g_reblackSec = 15;
+static ULONGLONG g_startTick;
+static int   g_protectSec;
+static float g_pulse;
+
+/* 守护线程 */
+static HANDLE g_stopEvent;
+static HANDLE g_guardThread;
+
+/* 显示器状态通知 */
+static HANDLE g_displayNotify;
+
+/* 托盘 */
+static NOTIFYICONDATAW g_nid;
+static BOOL g_trayOk;
+static HICON g_iconIdle, g_iconActive;
+
+/* Agent 进程检测：内置 11 个 + 同目录 agents.ini 自定义。
+ * 只读进程名，不注入、不挂钩。 */
+typedef struct {
+    WCHAR name[28];
+    WCHAR keys[AGENT_KEYS][32];
+    int   nkeys;
+    BOOL  running;
+} AgentInfo;
+static AgentInfo g_agents[AGENT_MAX];
+static int g_agentCount;
+static DWORD g_agentBits;   /* 运行中组合的位图，用于只在变化时写日志 */
+
+static void LogMsg(const WCHAR *fmt, ...);
+static void CleanupAndExit(HWND hwnd);
+
+/* ---------------------------------------------------------------- 小工具 */
+static RectF RF(float x, float y, float w, float h) { return RectF(x, y, w, h); }
+
+static RectF ScaleAboutCenter(const RectF &r, float s)
+{
+    float w = r.Width * s, h = r.Height * s;
+    return RectF(r.X + (r.Width - w) * 0.5f, r.Y + (r.Height - h) * 0.5f, w, h);
+}
+
+static void AddRound(GraphicsPath &p, const RectF &r, float rad)
+{
+    float d = rad * 2.0f;
+    if (d > r.Width)  d = r.Width;
+    if (d > r.Height) d = r.Height;
+    if (d <= 0.0f) { p.AddRectangle(r); return; }
+    p.AddArc(r.X, r.Y, d, d, 180, 90);
+    p.AddArc(r.X + r.Width - d, r.Y, d, d, 270, 90);
+    p.AddArc(r.X + r.Width - d, r.Y + r.Height - d, d, d, 0, 90);
+    p.AddArc(r.X, r.Y + r.Height - d, d, d, 90, 90);
+    p.CloseFigure();
+}
+
+/* 单行文本；align: 0=左 1=中 2=右；垂直居中 */
+static void Txt(Graphics &g, const WCHAR *s, Font *f, const RectF &r,
+                const Color &c, int align = 0)
+{
+    StringFormat fmt;
+    fmt.SetAlignment(align == 1 ? StringAlignmentCenter
+                   : align == 2 ? StringAlignmentFar : StringAlignmentNear);
+    fmt.SetLineAlignment(StringAlignmentCenter);
+    fmt.SetFormatFlags(StringFormatFlagsNoWrap);
+    SolidBrush b(c);
+    g.DrawString(s, -1, f, r, &fmt, &b);
+}
+
+static Font *MakeFont(float px, int style)
+{
+    static const WCHAR *fams[] = { L"Microsoft YaHei UI", L"Microsoft YaHei",
+                                   L"Segoe UI", L"Arial" };
+    for (int i = 0; i < 4; ++i) {
+        FontFamily ff(fams[i]);
+        if (ff.IsAvailable())
+            return new Font(&ff, px, style, UnitPixel);
+    }
+    return new Font(L"Arial", px, style, UnitPixel);
+}
+
+static BOOL Step(float &v, float target, float k)
+{
+    float d = target - v;
+    if (fabsf(d) < 0.004f) {
+        if (v == target) return FALSE;
+        v = target;
+        return TRUE;
+    }
+    v += d * k;
+    return TRUE;
+}
+
+static DWORD IdleMillis()
+{
+    LASTINPUTINFO lii;
+    lii.cbSize = sizeof(lii);
+    if (!GetLastInputInfo(&lii)) return 0;
+    return (DWORD)(GetTickCount() - lii.dwTime);
+}
+
+/* ---------------------------------------------------------------- 日志 */
+static void LogMsg(const WCHAR *fmt, ...)
+{
+    WCHAR path[MAX_PATH], buf[1024];
+    WCHAR *p;
+    FILE *fp;
+    va_list ap;
+
+    GetTempPathW(MAX_PATH, path);
+    lstrcatW(path, L"AgentKeepAwake.log");
+    fp = _wfopen(path, L"a, ccs=UTF-8");
+    if (!fp) return;
+
+    va_start(ap, fmt);
+    _vsnwprintf(buf, 1023, fmt, ap);
+    buf[1023] = 0;
+    va_end(ap);
+
+    p = buf;
+    while (*p) {
+        if (*p == L'\r' || *p == L'\n') *p = L' ';
+        ++p;
+    }
+    fwprintf(fp, L"[%lu] %ls\n", GetCurrentProcessId(), buf);
+    fclose(fp);
+}
+
+/* ---------------------------------------------------------------- 电源内核 */
+static DWORD WINAPI GuardThread(LPVOID)
+{
+    SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED);
+    LogMsg(L"guard: hold ES_CONTINUOUS|ES_SYSTEM_REQUIRED (no process is suspended)");
+
+    while (WaitForSingleObject(g_stopEvent, 20000) == WAIT_TIMEOUT)
+        SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED);
+
+    SetThreadExecutionState(ES_CONTINUOUS);
+    LogMsg(L"guard: power request released");
+    return 0;
+}
+
+/* 只关显示输出。
+ * 先发给自己的窗口：DefWindowProc 执行 SC_MONITORPOWER，只走本进程这条消息，
+ * 不广播 —— 广播会让百度网盘一类“锁屏监听”软件误弹“触发锁定失败”，
+ * 打断用户正在跑的 agent。
+ * 3 秒内收不到系统的“显示器已关”通知，才回退一次广播（兜底）。 */
+static void MonitorOff()
+{
+    InterlockedExchange(&g_screenOff, 1);
+    g_monWant = 0;
+    g_monAt = GetTickCount();
+    g_monConfirmed = FALSE;
+    PostMessageW(g_hwnd, WM_SYSCOMMAND, SC_MONITORPOWER, 2);
+    SetTimer(g_hwnd, TIMER_MON, 700, NULL);
+    LogMsg(L"screen: monitor-off posted (self)");
+}
+
+static void MonitorOn()
+{
+    InterlockedExchange(&g_screenOff, 0);
+    g_monWant = 1;
+    g_monAt = GetTickCount();
+    g_monConfirmed = FALSE;
+    PostMessageW(g_hwnd, WM_SYSCOMMAND, SC_MONITORPOWER, (LPARAM)-1);
+    SetTimer(g_hwnd, TIMER_MON, 700, NULL);
+    LogMsg(L"screen: monitor-on posted (self)");
+}
+
+static void RegisterDisplayNotify(HWND hwnd)
+{
+    PFN_RegPowerNotify reg = (PFN_RegPowerNotify)(void *)GetProcAddress(
+        GetModuleHandleW(L"user32.dll"), "RegisterPowerSettingNotification");
+    if (!reg) { LogMsg(L"display: RegisterPowerSettingNotification missing"); return; }
+
+    g_displayNotify = reg((HANDLE)hwnd, &GUID_DISPLAY_STATE,
+                          AKA_DEVICE_NOTIFY_WINDOW_HANDLE);
+    LogMsg(L"display: notify handle=%p", g_displayNotify);
+}
+
+static void UnregisterDisplayNotify()
+{
+    PFN_UnregPowerNotify unreg;
+    if (!g_displayNotify) return;
+    unreg = (PFN_UnregPowerNotify)(void *)GetProcAddress(
+        GetModuleHandleW(L"user32.dll"), "UnregisterPowerSettingNotification");
+    if (unreg) unreg(g_displayNotify);
+    g_displayNotify = NULL;
+}
+
+/* ---------------------------------------------------------------- 设置持久化 */
+static void LoadSettings()
+{
+    HKEY k;
+    DWORD v = 0, sz = sizeof(v);
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\AgentKeepAwake", 0,
+                      KEY_READ, &k) == ERROR_SUCCESS) {
+        if (RegQueryValueExW(k, L"ReblackSec", NULL, NULL, (BYTE *)&v, &sz) == ERROR_SUCCESS) {
+            if (v == 0 || v == 5 || v == 15 || v == 30) g_reblackSec = (int)v;
+        }
+        sz = sizeof(v);
+        if (RegQueryValueExW(k, L"PrefMode", NULL, NULL, (BYTE *)&v, &sz) == ERROR_SUCCESS) {
+            if (v == 1 || v == 2) g_prefMode = (int)v;
+        }
+        RegCloseKey(k);
+    }
+}
+
+static void SaveSettings()
+{
+    HKEY k;
+    DWORD d;
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, L"Software\\AgentKeepAwake", 0, NULL, 0,
+                        KEY_WRITE, NULL, &k, &d) != ERROR_SUCCESS) return;
+    d = (DWORD)g_reblackSec;
+    RegSetValueExW(k, L"ReblackSec", 0, REG_DWORD, (const BYTE *)&d, sizeof(d));
+    d = (DWORD)g_prefMode;
+    RegSetValueExW(k, L"PrefMode", 0, REG_DWORD, (const BYTE *)&d, sizeof(d));
+    RegCloseKey(k);
+}
+
+/* ---------------------------------------------------------------- Agent 检测 */
+static void TrimW(WCHAR *s)
+{
+    WCHAR *p = s, *e;
+    while (*p == L' ' || *p == L'\t' || *p == L'\r' || *p == L'\n') ++p;
+    if (p != s) memmove(s, p, ((size_t)lstrlenW(p) + 1) * sizeof(WCHAR));
+    e = s + lstrlenW(s);
+    while (e > s && (e[-1] == L' ' || e[-1] == L'\t' ||
+                     e[-1] == L'\r' || e[-1] == L'\n')) *--e = 0;
+}
+
+static void AddAgentDef(const WCHAR *name, const WCHAR *keys)
+{
+    AgentInfo *a;
+    WCHAR buf[128], *p, *q;
+
+    if (g_agentCount >= AGENT_MAX) return;
+    a = &g_agents[g_agentCount];
+    ZeroMemory(a, sizeof(*a));
+    lstrcpynW(a->name, name, 28);
+
+    lstrcpynW(buf, keys, 128);
+    p = buf;
+    while (*p && a->nkeys < AGENT_KEYS) {
+        q = p;
+        while (*q && *q != L',' && *q != L';' && *q != L'|') ++q;
+        if (*q) *q++ = 0;
+        TrimW(p);
+        if (*p) {
+            lstrcpynW(a->keys[a->nkeys], p, 32);
+            CharLowerBuffW(a->keys[a->nkeys], (DWORD)lstrlenW(a->keys[a->nkeys]));
+            a->nkeys++;
+        }
+        p = q;
+    }
+    if (a->nkeys > 0) g_agentCount++;
+}
+
+/* 内置名单 + 同目录 agents.ini（UTF-8 或 ANSI，每行：显示名=关键字1,关键字2） */
+static void LoadAgents()
+{
+    WCHAR path[MAX_PATH], line[256];
+    WCHAR *p;
+    FILE *fp;
+
+    g_agentCount = 0;
+    /* 国内版 / 国际版是不同 exe，分开登记（= 表示精确整名，互不串台） */
+    AddAgentDef(L"Trae",         L"=trae.exe");
+    AddAgentDef(L"Trae CN",      L"=trae cn.exe");
+    AddAgentDef(L"WorkBuddy",    L"=workbuddy.exe");
+    AddAgentDef(L"WorkBuddy AI", L"=workbuddyai.exe");
+    AddAgentDef(L"Qoder",        L"=qoder.exe,=qoder launcher.exe");
+    AddAgentDef(L"Qoder CN",     L"qoder cn");
+    AddAgentDef(L"DeepSeek",     L"deepseek");          /* DeepSeek Harness */
+    AddAgentDef(L"ZCode",        L"=zcode.exe");
+    AddAgentDef(L"OpenCode",     L"=opencode.exe");
+    AddAgentDef(L"Hermes",       L"=hermes.exe");
+    AddAgentDef(L"MiniMax",      L"=minimax code.exe");
+    AddAgentDef(L"MiMo",         L"=xiaomi mimo.exe");
+    AddAgentDef(L"妙手",         L"=妙手.exe,miaoshou");
+    AddAgentDef(L"Cursor",       L"=cursor.exe");
+    AddAgentDef(L"Windsurf",     L"windsurf");
+    AddAgentDef(L"Claude",       L"=claude.exe");
+    /* Codex 必须精确：否则会命中后台服务 codex-windows-sandbox-service */
+    AddAgentDef(L"Codex",        L"=codex.exe");
+
+    GetModuleFileNameW(NULL, path, MAX_PATH);
+    p = wcsrchr(path, L'\\');
+    if (p) p[1] = 0;
+    lstrcatW(path, L"agents.ini");
+
+    fp = _wfopen(path, L"r, ccs=UTF-8");
+    if (!fp) fp = _wfopen(path, L"r");
+    if (!fp) {
+        LogMsg(L"agents: builtin %d, no agents.ini", g_agentCount);
+        return;
+    }
+    while (fgetws(line, 256, fp)) {
+        WCHAR *eq;
+        TrimW(line);
+        if (!line[0] || line[0] == L'#' || line[0] == L';' || line[0] == L'[')
+            continue;
+        eq = wcschr(line, L'=');
+        if (!eq) continue;
+        *eq = 0;
+        TrimW(line);
+        TrimW(eq + 1);
+        if (line[0] && eq[1]) AddAgentDef(line, eq + 1);
+    }
+    fclose(fp);
+    LogMsg(L"agents: total %d (builtin + agents.ini)", g_agentCount);
+}
+
+/* 关键字匹配：默认“进程名包含关键字”；关键字以 = 开头表示精确匹配整名
+ * （可省略 .exe）。用来排除同名后台服务，例如 =codex.exe 不会命中
+ * codex-windows-sandbox-service。 */
+static BOOL AgentKeyMatch(const WCHAR *exeLow, const WCHAR *key)
+{
+    if (key[0] == L'=') {
+        const WCHAR *k = key + 1;
+        if (lstrcmpW(exeLow, k) == 0) return TRUE;
+        {
+            WCHAR base[MAX_PATH];
+            WCHAR *dot;
+            lstrcpynW(base, exeLow, MAX_PATH);
+            dot = wcsrchr(base, L'.');
+            if (dot) { *dot = 0; if (lstrcmpW(base, k) == 0) return TRUE; }
+        }
+        return FALSE;
+    }
+    return wcsstr(exeLow, key) != NULL;
+}
+
+static void ScanAgents()
+{
+    HANDLE snap;
+    PROCESSENTRY32W pe;
+    int i, k;
+
+    for (i = 0; i < g_agentCount; ++i) g_agents[i].running = FALSE;
+
+    snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap == INVALID_HANDLE_VALUE) return;
+
+    pe.dwSize = sizeof(pe);
+    if (Process32FirstW(snap, &pe)) {
+        do {
+            WCHAR low[MAX_PATH];
+            lstrcpynW(low, pe.szExeFile, MAX_PATH);
+            CharLowerBuffW(low, (DWORD)lstrlenW(low));
+            for (i = 0; i < g_agentCount; ++i) {
+                for (k = 0; k < g_agents[i].nkeys; ++k) {
+                    if (AgentKeyMatch(low, g_agents[i].keys[k])) {
+                        g_agents[i].running = TRUE;
+                        break;
+                    }
+                }
+            }
+        } while (Process32NextW(snap, &pe));
+    }
+    CloseHandle(snap);
+
+    /* 组合变化时才写一行日志，便于排查“为什么某个没亮” */
+    {
+        DWORD bits = 0;
+        WCHAR buf[512] = L"";
+        for (i = 0; i < g_agentCount && i < 32; ++i) {
+            if (!g_agents[i].running) continue;
+            bits |= (1u << i);
+            if (buf[0]) lstrcatW(buf, L", ");
+            lstrcatW(buf, g_agents[i].name);
+        }
+        if (bits != g_agentBits) {
+            g_agentBits = bits;
+            LogMsg(L"agents: running = [%ls]", buf);
+        }
+    }
+}
+
+/* ---------------------------------------------------------------- 保护开关 */
+static void MarkDirty();
+static void UpdateTrayTip();
+
+static void HideToTray()
+{
+    KillTimer(g_hwnd, TIMER_UI);
+    KillTimer(g_hwnd, TIMER_SCAN);
+    g_hoverId = B_NONE;
+    g_downId = B_NONE;
+    ShowWindow(g_hwnd, SW_HIDE);
+}
+
+static void ShowMain()
+{
+    ShowWindow(g_hwnd, SW_SHOW);
+    ShowWindow(g_hwnd, SW_RESTORE);
+    SetForegroundWindow(g_hwnd);
+    ScanAgents();
+    SetTimer(g_hwnd, TIMER_UI, 16, NULL);
+    SetTimer(g_hwnd, TIMER_SCAN, 3000, NULL);
+    MarkDirty();
+}
+
+static void StartProtection(int mode)
+{
+    if (g_mode != 0) return;
+
+    g_stopEvent = CreateEventW(NULL, TRUE, FALSE, NULL);
+    if (!g_stopEvent) { LogMsg(L"start: CreateEvent failed"); return; }
+
+    g_guardThread = CreateThread(NULL, 0, GuardThread, NULL, 0, NULL);
+    if (!g_guardThread) {
+        CloseHandle(g_stopEvent);
+        g_stopEvent = NULL;
+        LogMsg(L"start: CreateThread failed");
+        return;
+    }
+
+    InterlockedExchange(&g_mode, mode);
+    g_startTick = GetTickCount64();
+    g_protectSec = 0;
+    SetTimer(g_hwnd, TIMER_CLOCK, 1000, NULL);
+
+    LogMsg(L"start: protection ON (mode=%d, reblack=%d)", mode, g_reblackSec);
+
+    /* 先刷新界面/托盘，再关屏：显示器进入待机时 explorer 响应会变慢 */
+    UpdateTrayTip();
+    HideToTray();
+
+    if (mode == 1) MonitorOff();
+    MarkDirty();
+}
+
+static void StopProtection()
+{
+    if (g_mode == 0) return;
+
+    KillTimer(g_hwnd, TIMER_CLOCK);
+    if (g_stopEvent) SetEvent(g_stopEvent);
+    if (g_guardThread) {
+        WaitForSingleObject(g_guardThread, 3000);
+        CloseHandle(g_guardThread);
+        g_guardThread = NULL;
+    }
+    if (g_stopEvent) {
+        CloseHandle(g_stopEvent);
+        g_stopEvent = NULL;
+    }
+    InterlockedExchange(&g_mode, 0);
+    g_protectSec = 0;
+    LogMsg(L"stop: protection OFF");
+
+    if (g_screenOff) MonitorOn();
+
+    ShowMain();
+    UpdateTrayTip();
+}
+
+static void ToggleProtection()
+{
+    if (g_mode == 0) StartProtection(g_prefMode == 2 ? 2 : 1);
+    else             StopProtection();
+}
+
+/* 深度防睡（仅托盘入口，需 UAC）：只改睡眠相关，绝不动“关闭显示器时间” */
+static void DeepConfig()
+{
+    static const WCHAR *params =
+        L"/c powercfg /setacvalueindex SCHEME_CURRENT 238c9fa8-0aad-41ed-83f4-97be242c8f20 29f6c1db-86da-48c5-9fdb-f2b67b1f44da 0"
+        L" && powercfg /setdcvalueindex SCHEME_CURRENT 238c9fa8-0aad-41ed-83f4-97be242c8f20 29f6c1db-86da-48c5-9fdb-f2b67b1f44da 0"
+        L" && powercfg /setacvalueindex SCHEME_CURRENT 238c9fa8-0aad-41ed-83f4-97be242c8f20 9d7815a6-7ee4-497e-8888-515a05f02364 0"
+        L" && powercfg /setdcvalueindex SCHEME_CURRENT 238c9fa8-0aad-41ed-83f4-97be242c8f20 9d7815a6-7ee4-497e-8888-515a05f02364 0"
+        L" && powercfg /setacvalueindex SCHEME_CURRENT 238c9fa8-0aad-41ed-83f4-97be242c8f20 7bc4a2f9-d8fc-4469-b07b-33eb785aaca0 0"
+        L" && powercfg /setacvalueindex SCHEME_CURRENT 4f971e89-eebd-4455-a8de-9e59040e7347 5ca83367-6e45-459f-a27b-476b1d01c936 0"
+        L" && powercfg /setdcvalueindex SCHEME_CURRENT 4f971e89-eebd-4455-a8de-9e59040e7347 5ca83367-6e45-459f-a27b-476b1d01c936 0"
+        L" && powercfg /hibernate off"
+        L" && powercfg /setactive SCHEME_CURRENT";
+
+    INT_PTR r = (INT_PTR)ShellExecuteW(g_hwnd, L"runas", L"cmd.exe",
+                                       (LPWSTR)params, NULL, SW_HIDE);
+    if (r <= 32) {
+        MessageBoxW(g_hwnd,
+            L"未能执行电源配置（可能取消了 UAC 授权）。\n\n"
+            L"普通使用不需要这项：守护本身已阻止系统睡眠。\n"
+            L"只有在合盖/无人值守仍会睡的环境才需要它。",
+            APP_NAME, MB_ICONINFORMATION);
+    } else {
+        MessageBoxW(g_hwnd,
+            L"已发送深度防睡配置（只改睡眠/休眠/合盖，不改关屏时间）。\n\n"
+            L"本操作不备份原值；要还原请用 powercfg 恢复默认方案。",
+            APP_NAME, MB_ICONINFORMATION);
+    }
+}
+
+/* ---------------------------------------------------------------- 托盘 */
+static void AddTrayIcon()
+{
+    int sx = GetSystemMetrics(SM_CXSMICON), sy = GetSystemMetrics(SM_CYSMICON);
+
+    ZeroMemory(&g_nid, sizeof(g_nid));
+    g_nid.cbSize = sizeof(g_nid);
+    g_nid.hWnd = g_hwnd;
+    g_nid.uID = 1;
+    g_nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
+    g_nid.uCallbackMessage = WM_TRAY;
+    g_nid.hIcon = (HICON)LoadImageW(g_inst, MAKEINTRESOURCEW(1), IMAGE_ICON, sx, sy, 0);
+    lstrcpynW(g_nid.szTip, L"AgentKeepAwake · 未开启", ARRAYSIZE(g_nid.szTip));
+
+    g_trayOk = Shell_NotifyIconW(NIM_ADD, &g_nid);
+    if (g_trayOk) {
+        g_nid.uVersion = NOTIFYICON_VERSION_4;
+        Shell_NotifyIconW(NIM_SETVERSION, &g_nid);
+    }
+    LogMsg(L"tray: add ok=%d", g_trayOk);
+}
+
+static void UpdateTrayTip()
+{
+    WCHAR tip[128];
+    HICON ic;
+
+    if (!g_trayOk) return;
+    /* 屏幕关着时不要动 shell：explorer 重绘会把刚关掉的显示器点亮 */
+    if (g_screenOff && g_mode != 0) return;
+
+    if (g_mode == 0)
+        lstrcpynW(tip, L"AgentKeepAwake · 未开启", ARRAYSIZE(tip));
+    else if (g_mode == 1)
+        lstrcpynW(tip, L"AgentKeepAwake · 守护中 · 屏幕已关闭", ARRAYSIZE(tip));
+    else
+        lstrcpynW(tip, L"AgentKeepAwake · 防睡守护中 · 屏幕保持亮", ARRAYSIZE(tip));
+
+    ic = (HICON)LoadImageW(g_inst, MAKEINTRESOURCEW(g_mode ? 2 : 1), IMAGE_ICON,
+                           GetSystemMetrics(SM_CXSMICON),
+                           GetSystemMetrics(SM_CYSMICON), 0);
+    if (ic) g_nid.hIcon = ic;
+    lstrcpynW(g_nid.szTip, tip, ARRAYSIZE(g_nid.szTip));
+    g_nid.uFlags = NIF_MESSAGE | NIF_ICON | NIF_TIP;
+    Shell_NotifyIconW(NIM_MODIFY, &g_nid);
+    if (ic) DestroyIcon(ic);
+    g_nid.hIcon = NULL;
+}
+
+static void ShowTrayMenu()
+{
+    HMENU m = CreatePopupMenu();
+    POINT pt;
+
+    AppendMenuW(m, MF_STRING, 2001, g_mode ? L"停止守护" : L"开始息屏守护");
+    AppendMenuW(m, MF_STRING, 2002, L"立即熄屏");
+    AppendMenuW(m, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(m, MF_STRING, 2003, L"显示主窗口");
+    AppendMenuW(m, MF_STRING, 2004, L"深度防睡配置（管理员）…");
+    AppendMenuW(m, MF_SEPARATOR, 0, NULL);
+    AppendMenuW(m, MF_STRING, 2005, L"退出程序");
+
+    SetMenuDefaultItem(m, 2003, FALSE);
+    GetCursorPos(&pt);
+    SetForegroundWindow(g_hwnd);
+    TrackPopupMenu(m, TPM_RIGHTBUTTON, pt.x, pt.y, 0, g_hwnd, NULL);
+    DestroyMenu(m);
+}
+
+/* ---------------------------------------------------------------- 绘制资源 */
+static void BuildLayout()
+{
+    float pw = (float)SCALE(PANEL_W), ph = (float)SCALE(PANEL_H);
+    float pad = (float)SCALE(PAD);
+    float w = pw - pad * 2.0f;
+
+    rPanel = RF(0, 0, pw, ph);
+
+    rHero     = RF(pad, (float)SCALE(62),  w, (float)SCALE(240));
+    rMain     = RF(rHero.X + SCALE(18), rHero.Y + SCALE(152),
+                   rHero.Width - SCALE(36), (float)SCALE(52));
+    rAgents   = RF(pad, (float)SCALE(314), w, (float)SCALE(122));
+    rSettings = RF(pad, (float)SCALE(446), w, (float)SCALE(118));
+
+    rBtnMin   = RF(pw - pad - SCALE(26) * 2 - SCALE(6), (float)SCALE(16),
+                   (float)SCALE(26), (float)SCALE(26));
+    rBtnClose = RF(pw - pad - SCALE(26), (float)SCALE(16),
+                   (float)SCALE(26), (float)SCALE(26));
+    rBtnExit  = RF(pw - pad - SCALE(64), (float)SCALE(572),
+                   (float)SCALE(64), (float)SCALE(20));
+
+    /* 设置卡两行 */
+    {
+        float x = rSettings.X + SCALE(476 - 16) - SCALE(202);
+        float y = rSettings.Y + SCALE(12);
+        for (int i = 0; i < 4; ++i)
+            rRb[i] = RF(x + i * (SCALE(46) + SCALE(6)), y, (float)SCALE(46), (float)SCALE(26));
+
+        x = rSettings.X + SCALE(476 - 16) - SCALE(200);
+        y = rSettings.Y + SCALE(60);
+        rMd[0] = RF(x, y, (float)SCALE(108), (float)SCALE(26));
+        rMd[1] = RF(x + SCALE(108) + SCALE(8), y, (float)SCALE(84), (float)SCALE(26));
+
+        rSettingsRow1 = RF(rSettings.X + SCALE(16), rSettings.Y + SCALE(12),
+                           (float)SCALE(220), (float)SCALE(26));
+        rSettingsRow2 = RF(rSettings.X + SCALE(16), rSettings.Y + SCALE(60),
+                           (float)SCALE(220), (float)SCALE(26));
+    }
+
+    /* Agent 卡片 */
+    rAgentHint = RF(rAgents.X + rAgents.Width - SCALE(16) - SCALE(240),
+                    rAgents.Y + SCALE(14), (float)SCALE(240), (float)SCALE(16));
+    rAgentsFoot = RF(rAgents.X + SCALE(16), rAgents.Y + SCALE(84),
+                     rAgents.Width - SCALE(32), (float)SCALE(16));
+    {
+        float x = rAgents.X + SCALE(16);
+        for (int i = 0; i < AGENT_CHIPS; ++i) {
+            int row = i / 4, col = i % 4;
+            rChip[i] = RF(x + col * (SCALE(106) + SCALE(6)),
+                          rAgents.Y + SCALE(44) + row * (SCALE(34) + SCALE(6)),
+                          (float)SCALE(106), (float)SCALE(34));
+        }
+    }
+}
+
+static void InitGfx()
+{
+    fName      = MakeFont((float)SCALE(13),   FontStyleBold);
+    fSub       = MakeFont((float)SCALE(9),    0);
+    fStatus    = MakeFont((float)SCALE(19),   FontStyleBold);
+    fStatusSub = MakeFont((float)SCALE(10),   0);
+    fMetricL   = MakeFont((float)SCALE(8.5f), 0);
+    fMetricV   = MakeFont((float)SCALE(15),   FontStyleBold);
+    fBtn       = MakeFont((float)SCALE(12.5f),FontStyleBold);
+    fPill      = MakeFont((float)SCALE(9.5f), 0);
+    fPillOn    = MakeFont((float)SCALE(9.5f), FontStyleBold);
+    fChip      = MakeFont((float)SCALE(9.5f), 0);
+    fCardTitle = MakeFont((float)SCALE(10),   FontStyleBold);
+    fFoot      = MakeFont((float)SCALE(8.5f), 0);
+    fHint      = MakeFont((float)SCALE(8.5f), 0);
+
+    BuildLayout();
+}
+
+/* 简易箱式模糊（在小图上做，代价极低） */
+static void BoxBlur(Bitmap *bmp, int r, int passes)
+{
+    Rect rc(0, 0, bmp->GetWidth(), bmp->GetHeight());
+    BitmapData bd;
+    int w, h, stride, pass, x, y, k, n;
+    BYTE *base, *tmp, *dst;
+
+    if (bmp->LockBits(&rc, ImageLockModeRead | ImageLockModeWrite,
+                      PixelFormat32bppPARGB, &bd) != Ok) return;
+    w = bmp->GetWidth();
+    h = bmp->GetHeight();
+    stride = bd.Stride;
+    base = (BYTE *)bd.Scan0;
+    tmp = (BYTE *)malloc((size_t)stride * h);
+
+    if (tmp) {
+        for (pass = 0; pass < passes; ++pass) {
+            /* 横向 */
+            for (y = 0; y < h; ++y) {
+                for (x = 0; x < w; ++x) {
+                    int sb = 0, sg = 0, sr = 0, sa = 0;
+                    n = 0;
+                    for (k = -r; k <= r; ++k) {
+                        int xx = x + k;
+                        BYTE *p;
+                        if (xx < 0) xx = 0;
+                        if (xx >= w) xx = w - 1;
+                        p = base + y * stride + xx * 4;
+                        sb += p[0]; sg += p[1]; sr += p[2]; sa += p[3];
+                        n++;
+                    }
+                    dst = tmp + y * stride + x * 4;
+                    dst[0] = (BYTE)(sb / n);
+                    dst[1] = (BYTE)(sg / n);
+                    dst[2] = (BYTE)(sr / n);
+                    dst[3] = (BYTE)(sa / n);
+                }
+            }
+            memcpy(base, tmp, (size_t)stride * h);
+
+            /* 纵向 */
+            for (x = 0; x < w; ++x) {
+                for (y = 0; y < h; ++y) {
+                    int sb = 0, sg = 0, sr = 0, sa = 0;
+                    n = 0;
+                    for (k = -r; k <= r; ++k) {
+                        int yy = y + k;
+                        BYTE *p;
+                        if (yy < 0) yy = 0;
+                        if (yy >= h) yy = h - 1;
+                        p = base + yy * stride + x * 4;
+                        sb += p[0]; sg += p[1]; sr += p[2]; sa += p[3];
+                        n++;
+                    }
+                    dst = tmp + y * stride + x * 4;
+                    dst[0] = (BYTE)(sb / n);
+                    dst[1] = (BYTE)(sg / n);
+                    dst[2] = (BYTE)(sr / n);
+                    dst[3] = (BYTE)(sa / n);
+                }
+            }
+            memcpy(base, tmp, (size_t)stride * h);
+        }
+        free(tmp);
+    }
+    bmp->UnlockBits(&bd);
+}
+
+/* 采样桌面（只用于玻璃底：重度模糊后仅保留色块与明暗） */
+static void BuildBackdrop()
+{
+    HDC sdc, mdc;
+    BITMAPINFO bmi;
+    HBITMAP hb, old;
+    void *bits = NULL;
+    RECT wr;
+    int w, h, i;
+    BYTE *px;
+
+    if (g_backdrop) { delete g_backdrop; g_backdrop = NULL; }
+    if (g_glass)    { delete g_glass;    g_glass = NULL; }
+
+    g_backdrop = new Bitmap(g_cw, g_ch, PixelFormat32bppPARGB);
+    {
+        Graphics g(g_backdrop);
+        g.SetInterpolationMode(InterpolationModeHighQualityBicubic);
+        g.Clear(Color(255, 10, 13, 20));
+    }
+
+    GetWindowRect(g_hwnd, &wr);
+    w = g_cw; h = g_ch;
+
+    sdc = GetDC(NULL);
+    mdc = CreateCompatibleDC(sdc);
+    ZeroMemory(&bmi, sizeof(bmi));
+    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bmi.bmiHeader.biWidth = w;
+    bmi.bmiHeader.biHeight = -h;
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    bmi.bmiHeader.biCompression = BI_RGB;
+    hb = CreateDIBSection(mdc, &bmi, DIB_RGB_COLORS, &bits, NULL, 0);
+
+    if (hb && bits) {
+        old = (HBITMAP)SelectObject(mdc, hb);
+        BitBlt(mdc, 0, 0, w, h, sdc, wr.left, wr.top, SRCCOPY | CAPTUREBLT);
+        SelectObject(mdc, old);
+
+        /* GDI 不写 alpha 通道：必须手动置 255，否则 GDI+ 视为全透明 */
+        px = (BYTE *)bits;
+        for (i = 0; i < w * h; ++i) px[i * 4 + 3] = 255;
+
+        {
+            Bitmap shot(w, h, w * 4, PixelFormat32bppPARGB, (BYTE *)bits);
+            Graphics g(g_backdrop);
+            g.SetInterpolationMode(InterpolationModeHighQualityBicubic);
+            g.DrawImage(&shot, RectF(0, 0, (REAL)w, (REAL)h));
+        }
+        DeleteObject(hb);
+    }
+    DeleteDC(mdc);
+    ReleaseDC(NULL, sdc);
+
+    /* 压暗 + 冷调 */
+    {
+        Graphics g(g_backdrop);
+        LinearGradientBrush tint(RectF(0, 0, (REAL)w, (REAL)h),
+                                 Color(196, 9, 12, 18), Color(232, 3, 5, 10),
+                                 LinearGradientModeVertical);
+        g.FillRectangle(&tint, RectF(0, 0, (REAL)w, (REAL)h));
+
+        /* 三团柔光，给玻璃提供“有东西可折射”的颜色 */
+        struct { float x, y, r; Color c; } blobs[3] = {
+            { 0.16f, 0.12f, 0.46f, Color(70,  64, 226, 197) },   /* 薄荷 */
+            { 0.92f, 0.42f, 0.42f, Color(64, 120, 110, 255) },   /* 蓝紫 */
+            { 0.30f, 0.96f, 0.52f, Color(52,  80, 150, 255) }    /* 深蓝 */
+        };
+        for (i = 0; i < 3; ++i) {
+            GraphicsPath ep;
+            float cx = blobs[i].x * w, cy = blobs[i].y * h, rr = blobs[i].r * w;
+            ep.AddEllipse(cx - rr, cy - rr, rr * 2, rr * 2);
+            PathGradientBrush pg(&ep);
+            pg.SetCenterColor(blobs[i].c);
+            Color edge(0, blobs[i].c.GetR(), blobs[i].c.GetG(), blobs[i].c.GetB());
+            int n = 1;
+            pg.SetSurroundColors(&edge, &n);
+            g.FillPath(&pg, &ep);
+        }
+
+        /* 四角压暗，突出中心玻璃 */
+        GraphicsPath all;
+        all.AddRectangle(RectF(0, 0, (REAL)w, (REAL)h));
+        PathGradientBrush vig(&all);
+        vig.SetCenterPoint(PointF(w * 0.5f, h * 0.38f));
+        vig.SetCenterColor(Color(0, 0, 0, 0));
+        Color edges[1] = { Color(120, 0, 0, 0) };
+        int n = 1;
+        vig.SetSurroundColors(edges, &n);
+        g.FillPath(&vig, &all);
+    }
+
+    /* 玻璃取样图：重度模糊版（降采样再升采样 = 廉价高质量模糊） */
+    {
+        int sw = g_cw / 22 + 1, sh = g_ch / 22 + 1;
+        Bitmap small(sw, sh, PixelFormat32bppPARGB);
+        {
+            Graphics gs(&small);
+            gs.SetInterpolationMode(InterpolationModeHighQualityBicubic);
+            gs.DrawImage(g_backdrop, RectF(0, 0, (REAL)sw, (REAL)sh));
+        }
+        BoxBlur(&small, 2, 3);
+        g_glass = new Bitmap(g_cw, g_ch, PixelFormat32bppPARGB);
+        Graphics gg(g_glass);
+        gg.SetInterpolationMode(InterpolationModeHighQualityBicubic);
+        gg.DrawImage(&small, RectF(0, 0, (REAL)g_cw, (REAL)g_ch));
+        SolidBrush milk(Color(14, 255, 255, 255));
+        gg.FillRectangle(&milk, RectF(0, 0, (REAL)g_cw, (REAL)g_ch));
+    }
+}
+
+static void InitCanvas()
+{
+    BITMAPINFO bmi;
+    int sh = SCALE(SHADOW_M);
+
+    g_cw = SCALE(PANEL_W) + sh * 2;
+    g_ch = SCALE(PANEL_H) + sh * 2;
+
+    ZeroMemory(&bmi, sizeof(bmi));
+    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bmi.bmiHeader.biWidth = g_cw;
+    bmi.bmiHeader.biHeight = -g_ch;
+    bmi.bmiHeader.biPlanes = 1;
+    bmi.bmiHeader.biBitCount = 32;
+    bmi.bmiHeader.biCompression = BI_RGB;
+
+    g_memDC = CreateCompatibleDC(NULL);
+    g_memBmp = CreateDIBSection(g_memDC, &bmi, DIB_RGB_COLORS, &g_memBits, NULL, 0);
+    SelectObject(g_memDC, g_memBmp);
+
+    g_canvas = new Bitmap(g_cw, g_ch, g_cw * 4, PixelFormat32bppPARGB, (BYTE *)g_memBits);
+}
+
+/* 面板投影：多层叠加模拟高斯阴影 */
+static void DrawPanelShadow(Graphics &g)
+{
+    for (int i = 7; i >= 1; --i) {
+        GraphicsPath p;
+        float e = (float)SCALE(2) * i;
+        AddRound(p, RF(rPanel.X - e * 0.55f, rPanel.Y + (float)SCALE(10) - e * 0.35f,
+                       rPanel.Width + e * 1.1f, rPanel.Height + e * 0.9f),
+                 (float)SCALE(26) + e * 0.55f);
+        SolidBrush b(Color(7, 0, 0, 0));
+        g.FillPath(&b, &p);
+    }
+}
+
+/* 玻璃卡片：模糊底 + 提亮 + 顶部高光 + 细描边 */
+static void GlassCard(Graphics &g, const RectF &r, float rad, int tint = 20)
+{
+    int sh = SCALE(SHADOW_M);
+    GraphicsPath path;
+    AddRound(path, r, rad);
+
+    GraphicsState st = g.Save();
+    g.SetClip(&path);
+    g.DrawImage(g_glass, RF(r.X, r.Y, r.Width, r.Height),
+                (REAL)(sh + r.X), (REAL)(sh + r.Y), (REAL)r.Width, (REAL)r.Height,
+                UnitPixel);
+    SolidBrush milk(Color(tint, 255, 255, 255));
+    g.FillPath(&milk, &path);
+
+    LinearGradientBrush gloss(RectF(r.X, r.Y, r.Width, r.Height * 0.62f),
+                              Color(16, 255, 255, 255), Color(0, 255, 255, 255),
+                              LinearGradientModeVertical);
+    g.FillPath(&gloss, &path);
+    g.Restore(st);
+
+    LinearGradientBrush borderC(RectF(r.X, r.Y, r.Width, r.Height),
+                                Color(46, 255, 255, 255), Color(16, 255, 255, 255),
+                                LinearGradientModeVertical);
+    Pen pen(&borderC, 1.0f);
+    g.DrawPath(&pen, &path);
+}
+
+static void DrawOrb(Graphics &g, float cx, float cy, float rad, BOOL active)
+{
+    float pulse = active ? (0.5f + 0.5f * sinf(g_pulse)) : 0.0f;
+
+    for (int i = 4; i >= 1; --i) {
+        float rr = rad + (float)SCALE(6) * i + pulse * SCALE(3);
+        int a = active ? (int)(18 * (1.0f - i / 5.0f) + 6)
+                       : (int)(6 * (1.0f - i / 5.0f));
+        SolidBrush b(active ? Color(a, 94, 226, 197) : Color(a, 150, 160, 175));
+        g.FillEllipse(&b, cx - rr, cy - rr, rr * 2, rr * 2);
+    }
+
+    GraphicsPath circ;
+    circ.AddEllipse(cx - rad, cy - rad, rad * 2, rad * 2);
+    PathGradientBrush pg(&circ);
+    pg.SetCenterPoint(PointF(cx - rad * 0.3f, cy - rad * 0.35f));
+    pg.SetCenterColor(active ? Color(255, 26, 74, 68) : Color(255, 30, 38, 49));
+    Color edge = active ? Color(255, 7, 20, 24) : Color(255, 15, 19, 26);
+    Color edges[1] = { edge };
+    int n = 1;
+    pg.SetSurroundColors(edges, &n);
+    g.FillPath(&pg, &circ);
+
+    Pen rim(active ? Color(120, 255, 255, 255) : Color(54, 255, 255, 255), 1.1f);
+    g.DrawEllipse(&rim, cx - rad + 1, cy - rad + 1, (rad - 1) * 2, (rad - 1) * 2);
+
+    /* 电源图形 */
+    Pen gp(active ? Color(255, 236, 255, 250) : Color(190, 210, 220, 232),
+           (REAL)SCALE(2.4));
+    gp.SetStartCap(LineCapRound);
+    gp.SetEndCap(LineCapRound);
+    float a = (float)SCALE(9);
+    g.DrawArc(&gp, cx - a, cy - a, a * 2, a * 2, 290, 320);
+    g.DrawLine(&gp, cx, cy - (float)SCALE(13), cx, cy - (float)SCALE(2));
+}
+
+static void DrawPill(Graphics &g, const RectF &r, BOOL on, float hv,
+                     const WCHAR *label)
+{
+    GraphicsPath p;
+    AddRound(p, r, r.Height * 0.5f);
+
+    if (on) {
+        LinearGradientBrush b(r, Color(255, 104, 230, 202),
+                              Color(255, 74, 196, 232), LinearGradientModeVertical);
+        g.FillPath(&b, &p);
+        Pen pen(Color(120, 255, 255, 255), 1.0f);
+        g.DrawPath(&pen, &p);
+        Txt(g, label, fPillOn, r, C_DARKTXT, 1);
+    } else {
+        SolidBrush b(Color((int)(14 + 20 * hv), 255, 255, 255));
+        g.FillPath(&b, &p);
+        Pen pen(Color((int)(26 + 26 * hv), 255, 255, 255), 1.0f);
+        g.DrawPath(&pen, &p);
+        Txt(g, label, fPill, r, C_TXT2, 1);
+    }
+}
+
+static void DrawMainButton(Graphics &g, BOOL active)
+{
+    float pr = g_press[B_MAIN], hv = g_hover[B_MAIN];
+    RectF r = ScaleAboutCenter(rMain, 1.0f - 0.012f * pr);
+    if (pr > 0.01f) r.Y += SCALE(1) * pr;
+
+    /* 外发光 */
+    for (int i = 3; i >= 1; --i) {
+        GraphicsPath gp;
+        float e = (float)SCALE(5) * i;
+        AddRound(gp, RF(r.X - e, r.Y - e * 0.4f, r.Width + e * 2, r.Height + e * 1.6f),
+                 r.Height * 0.5f + e);
+        int a = active ? (int)(13 * (1.0f - i / 4.0f) + 3)
+                       : (int)(16 * (1.0f - i / 4.0f) + 4);
+        SolidBrush b(active ? Color(a, 255, 110, 118) : Color(a, 80, 220, 190));
+        g.FillPath(&b, &gp);
+    }
+
+    GraphicsPath p;
+    AddRound(p, r, r.Height * 0.5f);
+
+    if (active) {
+        LinearGradientBrush b(r, Color(242, 255, 128, 134),
+                              Color(238, 226, 72, 94), LinearGradientModeVertical);
+        g.FillPath(&b, &p);
+    } else {
+        LinearGradientBrush b(r, Color(255, 102, 232, 205),
+                              Color(255, 58, 124, 246), LinearGradientModeVertical);
+        g.FillPath(&b, &p);
+    }
+
+    /* 顶部高光 = 液态玻璃的灵魂 */
+    {
+        GraphicsState st = g.Save();
+        g.SetClip(&p);
+        LinearGradientBrush sheen(RectF(r.X, r.Y, r.Width, r.Height * 0.5f),
+                                  Color(64, 255, 255, 255), Color(0, 255, 255, 255),
+                                  LinearGradientModeVertical);
+        g.FillRectangle(&sheen, RectF(r.X, r.Y, r.Width, r.Height));
+        g.Restore(st);
+    }
+
+    Pen pen(Color(150, 255, 255, 255), 1.0f);
+    g.DrawPath(&pen, &p);
+
+    if (hv > 0.01f) {
+        SolidBrush hb(Color((int)(26 * hv), 255, 255, 255));
+        g.FillPath(&hb, &p);
+    }
+
+    Txt(g, active ? L"停止守护" : (g_prefMode == 2 ? L"开始防睡守护" : L"开始息屏守护"),
+        fBtn, r, active ? Color(255, 255, 250, 250) : C_DARKTXT, 1);
+}
+
+static void DrawRoundIconButton(Graphics &g, const RectF &r, int id,
+                                const WCHAR *glyph, BOOL danger)
+{
+    float hv = g_hover[id];
+    GraphicsPath p;
+    AddRound(p, r, r.Height * 0.34f);
+    SolidBrush b(Color((int)(10 + 26 * hv),
+                       danger ? 255 : 255, danger ? 120 : 255, danger ? 120 : 255));
+    g.FillPath(&b, &p);
+    Pen pen(Color((int)(18 + 28 * hv), 255, 255, 255), 1.0f);
+    g.DrawPath(&pen, &p);
+    Txt(g, glyph, fPill, r, hv > 0.5f ? C_TXT : C_TXT2, 1);
+}
+
+static void FormatDuration(WCHAR *out, int cap, int sec)
+{
+    int h = sec / 3600, m = (sec / 60) % 60, s = sec % 60;
+    if (h > 99) h = 99;
+    wsprintfW(out, L"%02d:%02d:%02d", h, m, s);
+}
+
+static void DrawMetric(Graphics &g, float x, float y, const WCHAR *label,
+                       const WCHAR *value, const Color &vc)
+{
+    Txt(g, label, fMetricL, RF(x, y, SCALE(120), SCALE(12)), C_TXT4, 0);
+    Txt(g, value, fMetricV, RF(x - SCALE(2), y + SCALE(14), SCALE(140), SCALE(22)), vc, 0);
+}
+
+/* ---------------------------------------------------------------- 主绘制 */
+static void PaintFrame()
+{
+    if (!g_canvas || !g_backdrop) return;
+
+    Graphics g(g_canvas);
+    g.SetSmoothingMode(SmoothingModeAntiAlias);
+    g.SetTextRenderingHint(TextRenderingHintAntiAliasGridFit);
+    g.SetInterpolationMode(InterpolationModeHighQualityBicubic);
+    g.SetPixelOffsetMode(PixelOffsetModeHalf);
+    g.Clear(Color(0, 0, 0, 0));
+
+    int sh = SCALE(SHADOW_M);
+    g.TranslateTransform((REAL)sh, (REAL)sh);
+
+    DrawPanelShadow(g);
+
+    /* 面板底：桌面毛玻璃 */
+    GraphicsPath panelPath;
+    AddRound(panelPath, rPanel, (float)SCALE(26));
+    {
+        GraphicsState st = g.Save();
+        g.SetClip(&panelPath);
+        g.DrawImage(g_backdrop, RF(0, 0, rPanel.Width, rPanel.Height),
+                    (REAL)sh, (REAL)sh, (REAL)rPanel.Width, (REAL)rPanel.Height,
+                    UnitPixel);
+        g.Restore(st);
+    }
+
+    /* 外圈描边 */
+    {
+        LinearGradientBrush bc(RectF(0, 0, rPanel.Width, rPanel.Height),
+                               Color(64, 255, 255, 255), Color(22, 255, 255, 255),
+                               LinearGradientModeVertical);
+        Pen pen(&bc, 1.0f);
+        g.DrawPath(&pen, &panelPath);
+    }
+
+    BOOL active = (g_mode != 0);
+    WCHAR buf[160], buf2[160];
+
+    /* ---------- 顶栏 ---------- */
+    {
+        /* 应用图标：圆角玻璃托底 + 闪电剪影 */
+        RectF ir = RF((float)SCALE(PAD), (float)SCALE(17),
+                      (float)SCALE(24), (float)SCALE(24));
+        GraphicsPath ip;
+        AddRound(ip, ir, (float)SCALE(7));
+        LinearGradientBrush ib(ir, Color(255, 96, 226, 197),
+                               Color(255, 80, 130, 255), LinearGradientModeVertical);
+        g.FillPath(&ib, &ip);
+        {
+            SolidBrush bolt(Color(255, 6, 26, 30));
+            GraphicsPath bp;
+            PointF pts[6] = {
+                PointF(ir.X + ir.Width * 0.56f, ir.Y + ir.Height * 0.16f),
+                PointF(ir.X + ir.Width * 0.26f, ir.Y + ir.Height * 0.56f),
+                PointF(ir.X + ir.Width * 0.46f, ir.Y + ir.Height * 0.56f),
+                PointF(ir.X + ir.Width * 0.42f, ir.Y + ir.Height * 0.86f),
+                PointF(ir.X + ir.Width * 0.76f, ir.Y + ir.Height * 0.44f),
+                PointF(ir.X + ir.Width * 0.54f, ir.Y + ir.Height * 0.44f)
+            };
+            bp.AddPolygon(pts, 6);
+            g.FillPath(&bolt, &bp);
+        }
+
+        Txt(g, L"AgentKeepAwake", fName,
+            RF((float)SCALE(54), (float)SCALE(14), (float)SCALE(300), (float)SCALE(18)),
+            C_TXT, 0);
+        Txt(g, L"黑屏守护 · 让 agent 一直跑，让屏幕先休息", fSub,
+            RF((float)SCALE(54), (float)SCALE(33), (float)SCALE(330), (float)SCALE(14)),
+            C_TXT3, 0);
+
+        DrawRoundIconButton(g, rBtnMin, B_MIN, L"—", FALSE);
+        DrawRoundIconButton(g, rBtnClose, B_CLOSE, L"✕", TRUE);
+    }
+
+    /* ---------- 英雄卡 ---------- */
+    GlassCard(g, rHero, (float)SCALE(26), 28);
+    {
+        float cx = rHero.X + (float)SCALE(62);
+        float cy = rHero.Y + (float)SCALE(62);
+        DrawOrb(g, cx, cy, (float)SCALE(33), active);
+
+        const WCHAR *title;
+        if (g_mode == 0)              title = L"守护未开启";
+        else if (g_mode == 2)         title = L"防睡守护中";
+        else if (g_screenOff)         title = L"屏幕已熄灯";
+        else                          title = L"守护中 · 屏幕已亮";
+
+        Txt(g, title, fStatus,
+            RF(rHero.X + SCALE(108), rHero.Y + SCALE(36),
+               rHero.Width - SCALE(128), SCALE(26)), C_TXT, 0);
+
+        if (g_mode == 0)
+            lstrcpynW(buf, L"准备好后点一下，屏幕立刻关闭", ARRAYSIZE(buf));
+        else if (g_mode == 2)
+            lstrcpynW(buf, L"系统不休眠 · 屏幕按 Windows 电源计划", ARRAYSIZE(buf));
+        else if (g_screenOff)
+            lstrcpynW(buf, L"任务继续运行 · 系统保持不休眠", ARRAYSIZE(buf));
+        else {
+            if (g_reblackSec > 0)
+                wsprintfW(buf, L"无操作 %d 秒后自动重新熄屏", g_reblackSec);
+            else
+                lstrcpynW(buf, L"已停止自动重黑，由你手动控制", ARRAYSIZE(buf));
+        }
+        Txt(g, buf, fStatusSub,
+            RF(rHero.X + SCALE(109), rHero.Y + SCALE(66),
+               rHero.Width - SCALE(130), SCALE(16)), C_TXT3, 0);
+
+        /* 三个指标 */
+        {
+            float my = rHero.Y + SCALE(108);
+            WCHAR dur[32];
+
+            if (g_mode == 0) lstrcpynW(dur, L"--:--:--", 32);
+            else             FormatDuration(dur, 32, g_protectSec);
+
+            DrawMetric(g, rHero.X + SCALE(22), my, L"已守护", dur,
+                       g_mode ? C_TXT : C_TXT2);
+            DrawMetric(g, rHero.X + SCALE(172), my, L"显示器",
+                       g_screenOff ? L"关闭" : L"点亮",
+                       g_screenOff ? C_MINT : C_TXT2);
+            DrawMetric(g, rHero.X + SCALE(322), my, L"系统",
+                       g_mode ? L"不休眠" : L"正常",
+                       g_mode ? C_MINT : C_TXT3);
+
+            Pen sep(Color(22, 255, 255, 255), 1.0f);
+            g.DrawLine(&sep, rHero.X + SCALE(158), my + SCALE(2),
+                       rHero.X + SCALE(158), my + SCALE(34));
+            g.DrawLine(&sep, rHero.X + SCALE(308), my + SCALE(2),
+                       rHero.X + SCALE(308), my + SCALE(34));
+        }
+
+        DrawMainButton(g, g_mode != 0);
+
+        if (g_mode == 0)
+            lstrcpynW(buf, g_prefMode == 2 ? L"防睡模式不关屏，适合需要看屏幕的场景"
+                                           : L"点一下立即熄屏 · 鼠标一动就亮回来",
+                       ARRAYSIZE(buf));
+        else if (g_mode == 2)
+            lstrcpynW(buf, L"不主动关屏 · 屏幕由系统设置决定", ARRAYSIZE(buf));
+        else
+            lstrcpynW(buf, L"全程只关显示输出 · Ctrl+Alt+K 可停止", ARRAYSIZE(buf));
+
+        Txt(g, buf, fHint,
+            RF(rHero.X + SCALE(18), rHero.Y + SCALE(212),
+               rHero.Width - SCALE(36), SCALE(16)), C_TXT3, 1);
+    }
+
+    /* ---------- Agent 卡 ---------- */
+    GlassCard(g, rAgents, (float)SCALE(20), 26);
+    {
+        int order[AGENT_MAX], n = 0, i, shown, runN = 0, overflow = 0;
+
+        Txt(g, L"正在运行的 Agent", fCardTitle,
+            RF(rAgents.X + SCALE(16), rAgents.Y + SCALE(14),
+               SCALE(180), SCALE(16)), C_TXT2, 0);
+        {
+            WCHAR hint[64];
+            wsprintfW(hint, L"已配置 %d 个 · agents.ini 可加", g_agentCount);
+            Txt(g, hint, fHint, rAgentHint, C_TXT4, 2);
+        }
+
+        /* 运行中的全部列出（最多 8 个）；超出时最后一位显示 +N */
+        for (i = 0; i < g_agentCount; ++i)
+            if (g_agents[i].running) order[runN++] = i;
+        if (runN > AGENT_CHIPS) {
+            n = AGENT_CHIPS - 1;
+            overflow = runN - n;
+        } else {
+            n = runN;
+            for (i = 0; i < g_agentCount && n < 4; ++i)
+                if (!g_agents[i].running) order[n++] = i;
+        }
+        shown = runN;
+
+        for (i = 0; i < n; ++i) {
+            AgentInfo *ag = &g_agents[order[i]];
+            RectF cr = rChip[i];
+            GraphicsPath cp;
+            AddRound(cp, cr, (float)SCALE(11));
+            SolidBrush cb(Color(10, 255, 255, 255));
+            g.FillPath(&cb, &cp);
+            Pen cpen(Color(22, 255, 255, 255), 1.0f);
+            g.DrawPath(&cpen, &cp);
+
+            float dx = cr.X + SCALE(13), dy = cr.Y + cr.Height * 0.5f;
+            if (ag->running) {
+                SolidBrush glow(Color(46, 94, 226, 197));
+                g.FillEllipse(&glow, dx - (REAL)SCALE(5), dy - (REAL)SCALE(5),
+                              (REAL)SCALE(10), (REAL)SCALE(10));
+            }
+            SolidBrush dot(ag->running ? C_MINT : C_GRAYDOT);
+            g.FillEllipse(&dot, dx - (REAL)SCALE(2.6f), dy - (REAL)SCALE(2.6f),
+                          (REAL)SCALE(5.2f), (REAL)SCALE(5.2f));
+
+            Txt(g, ag->name, fChip,
+                RF(cr.X + SCALE(24), cr.Y, cr.Width - SCALE(30), cr.Height),
+                ag->running ? C_TXT : C_TXT4, 0);
+        }
+
+        if (overflow > 0) {
+            RectF cr = rChip[n];
+            GraphicsPath cp;
+            AddRound(cp, cr, (float)SCALE(11));
+            SolidBrush cb(Color(10, 255, 255, 255));
+            g.FillPath(&cb, &cp);
+            Pen cpen(Color(22, 255, 255, 255), 1.0f);
+            g.DrawPath(&cpen, &cp);
+
+            WCHAR ov[32];
+            wsprintfW(ov, L"+%d 个", overflow);
+            Txt(g, ov, fChip,
+                RF(cr.X + SCALE(13), cr.Y, cr.Width - SCALE(22), cr.Height),
+                C_TXT3, 0);
+        }
+
+        if (shown <= 4)
+            Txt(g, L"息屏期间它们照常运行：不挂起、不限速、不断网", fHint,
+                rAgentsFoot, C_TXT4, 0);
+    }
+
+    /* ---------- 设置卡 ---------- */
+    GlassCard(g, rSettings, (float)SCALE(20), 26);
+    {
+        Txt(g, L"亮屏后自动再熄屏", fCardTitle, rSettingsRow1, C_TXT2, 0);
+        Txt(g, L"守护模式", fCardTitle, rSettingsRow2, C_TXT2, 0);
+
+        static const WCHAR *labels[4] = { L"关", L"5 秒", L"15 秒", L"30 秒" };
+        static const int vals[4] = { 0, 5, 15, 30 };
+        for (int i = 0; i < 4; ++i)
+            DrawPill(g, rRb[i], g_reblackSec == vals[i], g_hover[B_RB0 + i], labels[i]);
+
+        DrawPill(g, rMd[0], g_prefMode == 1, g_hover[B_MD0], L"息屏 + 防睡");
+        DrawPill(g, rMd[1], g_prefMode == 2, g_hover[B_MD1], L"仅防睡");
+    }
+
+    /* ---------- 页脚 ---------- */
+    Txt(g, L"Ctrl+Alt+K 一键开关 · 关闭窗口只收进托盘", fHint,
+        RF((float)SCALE(PAD), (float)SCALE(572), (float)SCALE(360), (float)SCALE(20)),
+        C_TXT3, 0);
+    Txt(g, L"退出程序", fFoot, rBtnExit,
+        g_hover[B_EXIT] > 0.4f ? C_ROSE : C_TXT3, 2);
+
+    /* 交给 DWM */
+    {
+        RECT wr;
+        POINT ptDst, ptSrc = { 0, 0 };
+        SIZE sz = { g_cw, g_ch };
+        BLENDFUNCTION bf;
+        HDC sdc;
+
+        GetWindowRect(g_hwnd, &wr);
+        ptDst.x = wr.left;
+        ptDst.y = wr.top;
+        bf.BlendOp = AC_SRC_OVER;
+        bf.BlendFlags = 0;
+        bf.SourceConstantAlpha = 255;
+        bf.AlphaFormat = AC_SRC_ALPHA;
+
+        sdc = GetDC(NULL);
+        UpdateLayeredWindow(g_hwnd, sdc, &ptDst, &sz, g_memDC, &ptSrc, 0, &bf, ULW_ALPHA);
+        ReleaseDC(NULL, sdc);
+    }
+}
+
+static void MarkDirty()
+{
+    if (IsWindow(g_hwnd) && IsWindowVisible(g_hwnd)) {
+        PaintFrame();
+        InvalidateRect(g_hwnd, NULL, FALSE);
+    }
+}
+
+/* ---------------------------------------------------------------- 命中测试 */
+static int HitTest(int x, int y)
+{
+    PointF p((REAL)(x - SCALE(SHADOW_M)), (REAL)(y - SCALE(SHADOW_M)));
+    int i;
+    RECT rc;
+
+    for (i = 0; i < 4; ++i)
+        if (rRb[i].Contains(p)) return B_RB0 + i;
+    for (i = 0; i < 2; ++i)
+        if (rMd[i].Contains(p)) return B_MD0 + i;
+
+    if (rMain.Contains(p))  return B_MAIN;
+    if (rBtnMin.Contains(p))return B_MIN;
+    if (rBtnClose.Contains(p)) return B_CLOSE;
+    if (rBtnExit.Contains(p))  return B_EXIT;
+
+    /* 顶栏空白区可拖动 */
+    GetClientRect(g_hwnd, &rc);
+    if (y < SCALE(58) && x > SCALE(90) && x < SCALE(400)) return -2;
+    return B_NONE;
+}
+
+static void OnClick(int id)
+{
+    switch (id) {
+    case B_MAIN:
+        ToggleProtection();
+        break;
+    case B_MIN:
+    case B_CLOSE:
+        HideToTray();
+        LogMsg(L"ui: hidden to tray");
+        break;
+    case B_EXIT:
+        g_quit = TRUE;
+        PostMessageW(g_hwnd, WM_CLOSE, 0, 0);
+        break;
+    case B_RB0: g_reblackSec = 0;  SaveSettings(); MarkDirty(); break;
+    case B_RB1: g_reblackSec = 5;  SaveSettings(); MarkDirty(); break;
+    case B_RB2: g_reblackSec = 15; SaveSettings(); MarkDirty(); break;
+    case B_RB3: g_reblackSec = 30; SaveSettings(); MarkDirty(); break;
+    case B_MD0: g_prefMode = 1;    SaveSettings(); MarkDirty(); break;
+    case B_MD1: g_prefMode = 2;    SaveSettings(); MarkDirty(); break;
+    default:
+        break;
+    }
+}
+
+/* ---------------------------------------------------------------- 动画循环 */
+static void TickAnimate()
+{
+    if (!IsWindowVisible(g_hwnd)) return;
+
+    BOOL moved = FALSE;
+    for (int i = 0; i < B_COUNT; ++i) {
+        moved |= Step(g_hover[i], (g_hoverId == i) ? 1.0f : 0.0f, 0.24f);
+        moved |= Step(g_press[i], (g_downId  == i) ? 1.0f : 0.0f, 0.35f);
+    }
+    if (g_mode != 0) {
+        g_pulse += 0.07f;
+        if (g_pulse > 6.2831853f) g_pulse -= 6.2831853f;
+        PaintFrame();
+    } else if (moved) {
+        PaintFrame();
+    }
+}
+
+/* ---------------------------------------------------------------- 窗口过程 */
+static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+{
+    switch (msg) {
+    case WM_CREATE:
+        return 0;
+
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        HDC hdc = BeginPaint(hwnd, &ps);
+        /* 画面已由 UpdateLayeredWindow 提交，这里只清一下重绘区域 */
+        (void)hdc;
+        EndPaint(hwnd, &ps);
+        return 0;
+    }
+
+    case WM_ERASEBKGND:
+        return 1;
+
+    case WM_NCHITTEST: {
+        POINT pt;
+        int id;
+        pt.x = GET_X_LPARAM(lp);
+        pt.y = GET_Y_LPARAM(lp);
+        ScreenToClient(hwnd, &pt);
+        id = HitTest(pt.x, pt.y);
+        if (id == -2) return HTCAPTION;
+        if (id == B_NONE) {
+            /* 面板内部：吞掉点击，避免误点到下面被遮住的窗口；
+               面板外的投影边距：穿透 */
+            PointF pf((REAL)(pt.x - SCALE(SHADOW_M)),
+                      (REAL)(pt.y - SCALE(SHADOW_M)));
+            return rPanel.Contains(pf) ? HTCLIENT : HTTRANSPARENT;
+        }
+        return HTCLIENT;
+    }
+
+    case WM_MOUSEMOVE: {
+        POINT pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
+        int id = HitTest(pt.x, pt.y);
+        if (id != g_hoverId) {
+            g_hoverId = id;
+            /* 手型光标 */
+            if (id >= 0) SetCursor(LoadCursorW(NULL, IDC_HAND));
+        } else if (id >= 0) {
+            SetCursor(LoadCursorW(NULL, IDC_HAND));
+        }
+        if (!g_tracking) {
+            TRACKMOUSEEVENT tme;
+            tme.cbSize = sizeof(tme);
+            tme.dwFlags = TME_LEAVE;
+            tme.hwndTrack = hwnd;
+            TrackMouseEvent(&tme);
+            g_tracking = TRUE;
+        }
+        return 0;
+    }
+
+    case WM_MOUSELEAVE:
+        g_tracking = FALSE;
+        g_hoverId = B_NONE;
+        return 0;
+
+    case WM_SETCURSOR:
+        if (LOWORD(lp) == HTCLIENT) {
+            POINT pt;
+            GetCursorPos(&pt);
+            ScreenToClient(hwnd, &pt);
+            if (HitTest(pt.x, pt.y) >= 0) {
+                SetCursor(LoadCursorW(NULL, IDC_HAND));
+                return TRUE;
+            }
+        }
+        break;
+
+    case WM_LBUTTONDOWN: {
+        POINT pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
+        int id = HitTest(pt.x, pt.y);
+        LogMsg(L"ui: down %ld,%ld -> hit=%d", pt.x, pt.y, id);
+        if (id >= 0) {
+            g_downId = id;
+            SetCapture(hwnd);
+        }
+        return 0;
+    }
+
+    case WM_LBUTTONUP: {
+        POINT pt = { GET_X_LPARAM(lp), GET_Y_LPARAM(lp) };
+        int id = HitTest(pt.x, pt.y);
+        int was = g_downId;
+        g_downId = B_NONE;
+        if (GetCapture() == hwnd) ReleaseCapture();
+        if (was >= 0 && id == was) OnClick(id);
+        return 0;
+    }
+
+    case WM_LBUTTONDBLCLK:
+        return 0;
+
+    case WM_TIMER:
+        if (wp == TIMER_UI) {
+            TickAnimate();
+        } else if (wp == TIMER_CLOCK) {
+            if (g_mode != 0)
+                g_protectSec = (int)((GetTickCount64() - g_startTick) / 1000);
+
+            /* 只有「息屏 + 防睡」模式才自动关屏；仅防睡模式绝不碰显示器 */
+            if (g_mode == 1 && !g_screenOff && g_reblackSec > 0) {
+                DWORD idle = IdleMillis();
+                if (idle >= (DWORD)g_reblackSec * 1000) {
+                    LogMsg(L"reblack: idle=%lu ms -> off", idle);
+                    MonitorOff();
+                    UpdateTrayTip();
+                }
+            }
+            MarkDirty();
+        } else if (wp == TIMER_SCAN) {
+            ScanAgents();
+            MarkDirty();
+        } else if (wp == TIMER_MON) {
+            /* 自发指令 3 秒仍未被系统通知证实 -> 回退一次广播（兜底，极少用到） */
+            if (GetTickCount() - g_monAt >= 3000) {
+                if (g_monConfirmed) {
+                    LogMsg(L"screen: %ls confirmed (state=%lu)",
+                           g_monWant ? L"on" : L"off", g_lastDispState);
+                } else if (g_monWant == 0 && g_lastDispState != 0) {
+                    PostMessageW(HWND_BROADCAST, WM_SYSCOMMAND, SC_MONITORPOWER, 2);
+                    LogMsg(L"screen: off not confirmed, fallback broadcast");
+                } else if (g_monWant == 1 && g_lastDispState == 0) {
+                    PostMessageW(HWND_BROADCAST, WM_SYSCOMMAND, SC_MONITORPOWER, (LPARAM)-1);
+                    LogMsg(L"screen: on not confirmed, fallback broadcast");
+                } else {
+                    LogMsg(L"screen: %ls confirmed (state=%lu)",
+                           g_monWant ? L"on" : L"off", g_lastDispState);
+                }
+                KillTimer(hwnd, TIMER_MON);
+            }
+            return 0;
+        }
+        return 0;
+
+    case WM_POWERBROADCAST:
+        if (wp == PBT_POWERSETTINGCHANGE && lp) {
+            PBS_AKA *pbs = (PBS_AKA *)lp;
+            if (pbs->DataLength >= 4 &&
+                memcmp(&pbs->PowerSetting, &GUID_DISPLAY_STATE, sizeof(GUID)) == 0) {
+                DWORD st = *(DWORD *)pbs->Data;
+                g_lastDispState = st;
+                /* 只有“关屏收到 0 / 亮屏收到非 0”才算本次指令生效 */
+                if ((g_monWant == 0 && st == 0) || (g_monWant == 1 && st != 0))
+                    g_monConfirmed = TRUE;
+                InterlockedExchange(&g_screenOff, st == 0 ? 1 : 0);
+                LogMsg(L"display: state=%lu", st);
+                /* 这里只改状态；绝不调用 shell API，避免 explorer 重绘把屏幕点亮 */
+                MarkDirty();
+            }
+        }
+        return TRUE;
+
+    case WM_HOTKEY:
+        if (wp == 1) ToggleProtection();
+        return 0;
+
+    case WM_TRAY: {
+        WORD ev = LOWORD(lp);
+        if (ev == WM_RBUTTONUP || ev == WM_CONTEXTMENU) {
+            ShowTrayMenu();
+        } else if (ev == WM_LBUTTONUP || ev == NIN_SELECT || ev == NIN_KEYSELECT) {
+            ShowMain();
+        }
+        return 0;
+    }
+
+    case WM_COMMAND:
+        switch (LOWORD(wp)) {
+        case 2001: ToggleProtection(); break;
+        case 2002: MonitorOff(); break;   /* 只熄屏，不改变守护状态 */
+        case 2003: ShowMain(); break;
+        case 2004: DeepConfig(); break;
+        case 2005: PostMessageW(hwnd, WM_CLOSE, 0, 0); break;
+        }
+        return 0;
+
+    case WM_QUERYENDSESSION:
+        return TRUE;
+
+    case WM_ENDSESSION:
+        if (g_mode) StopProtection();
+        return 0;
+
+    case WM_CLOSE:
+        CleanupAndExit(hwnd);
+        return 0;
+
+    case WM_DESTROY:
+        PostQuitMessage(0);
+        return 0;
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+/* ---------------------------------------------------------------- 退出清理 */
+static void CleanupAndExit(HWND hwnd)
+{
+    if (g_mode != 0) StopProtection();
+
+    KillTimer(hwnd, TIMER_UI);
+    KillTimer(hwnd, TIMER_CLOCK);
+    KillTimer(hwnd, TIMER_SCAN);
+    KillTimer(hwnd, TIMER_MON);
+
+    if (g_trayOk) {
+        Shell_NotifyIconW(NIM_DELETE, &g_nid);
+        g_trayOk = FALSE;
+    }
+    UnregisterDisplayNotify();
+    UnregisterHotKey(hwnd, 1);
+    DestroyWindow(hwnd);
+}
+
+/* ---------------------------------------------------------------- 入口 */
+int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrev, LPWSTR cmd, int show)
+{
+    WNDCLASSEXW wc;
+    MSG msg;
+    HDC sdc;
+    HANDLE mutex;
+    int w, h, x, y;
+
+    (void)hPrev; (void)cmd;
+
+    g_inst = hInstance;
+    SetProcessDPIAware();
+
+    sdc = GetDC(NULL);
+    g_dpi = (UINT)GetDeviceCaps(sdc, LOGPIXELSY);
+    ReleaseDC(NULL, sdc);
+    if (g_dpi < 96) g_dpi = 96;
+
+    mutex = CreateMutexW(NULL, TRUE, L"AgentKeepAwake_SingleInstance_v4");
+    if (GetLastError() == ERROR_ALREADY_EXISTS) {
+        HWND old = FindWindowW(APP_CLASS, NULL);
+        if (old) {
+            ShowWindow(old, SW_SHOW);
+            SetForegroundWindow(old);
+        }
+        return 0;
+    }
+
+    {
+        GdiplusStartupInput gsi;
+        if (GdiplusStartup(&g_gdipToken, &gsi, NULL) != Ok) return 1;
+    }
+
+    LogMsg(L"=== AgentKeepAwake %ls start (pid=%lu, dpi=%u) ===",
+           APP_VER, GetCurrentProcessId(), g_dpi);
+
+    LoadSettings();
+    LoadAgents();
+
+    ZeroMemory(&wc, sizeof(wc));
+    wc.cbSize = sizeof(wc);
+    wc.style = CS_HREDRAW | CS_VREDRAW;
+    wc.lpfnWndProc = WndProc;
+    wc.hInstance = hInstance;
+    wc.hCursor = LoadCursorW(NULL, IDC_ARROW);
+    wc.lpszClassName = APP_CLASS;
+    wc.hIcon = LoadIconW(hInstance, MAKEINTRESOURCEW(1));
+    wc.hIconSm = (HICON)LoadImageW(hInstance, MAKEINTRESOURCEW(1), IMAGE_ICON, 16, 16, 0);
+
+    if (!RegisterClassExW(&wc)) {
+        LogMsg(L"RegisterClassEx failed (%lu)", GetLastError());
+        return 1;
+    }
+
+    InitCanvas();
+    InitGfx();
+
+    w = g_cw;
+    h = g_ch;
+    x = (GetSystemMetrics(SM_CXSCREEN) - w) / 2;
+    y = (GetSystemMetrics(SM_CYSCREEN) - h) / 3;
+    if (x < 0) x = 0;
+    if (y < 0) y = 0;
+
+    g_hwnd = CreateWindowExW(WS_EX_LAYERED | WS_EX_APPWINDOW, APP_CLASS, APP_TITLE,
+                             WS_POPUP, x, y, w, h, NULL, NULL, hInstance, NULL);
+    if (!g_hwnd) {
+        LogMsg(L"CreateWindowEx failed (%lu)", GetLastError());
+        return 1;
+    }
+
+    /* 桌面毛玻璃底必须在窗口显示之前采样，否则会把窗口自身也拍进去 */
+    BuildBackdrop();
+
+    ShowWindow(g_hwnd, SW_SHOW);
+    UpdateWindow(g_hwnd);
+
+    if (RegisterHotKey(g_hwnd, 1, MOD_CONTROL | MOD_ALT, 'K'))
+        LogMsg(L"hotkey: Ctrl+Alt+K ok");
+    else
+        LogMsg(L"hotkey: Ctrl+Alt+K register failed (%lu)", GetLastError());
+
+    RegisterDisplayNotify(g_hwnd);
+    AddTrayIcon();
+    ScanAgents();
+    SetTimer(g_hwnd, TIMER_UI, 16, NULL);
+    SetTimer(g_hwnd, TIMER_SCAN, 3000, NULL);
+    PaintFrame();
+
+    LogMsg(L"ui: shown %dx%d", w, h);
+
+    while (GetMessageW(&msg, NULL, 0, 0)) {
+        TranslateMessage(&msg);
+        DispatchMessageW(&msg);
+    }
+
+    LogMsg(L"=== AgentKeepAwake exit ===");
+
+    /* GDI+ 对象必须在 GdiplusShutdown 之前销毁 */
+    delete g_canvas;    g_canvas = NULL;
+    delete g_backdrop;  g_backdrop = NULL;
+    delete g_glass;     g_glass = NULL;
+    delete fName; delete fSub; delete fStatus; delete fStatusSub;
+    delete fMetricL; delete fMetricV; delete fBtn; delete fPill; delete fPillOn;
+    delete fChip; delete fCardTitle; delete fFoot; delete fHint;
+
+    DeleteObject(g_memBmp);
+    DeleteDC(g_memDC);
+
+    GdiplusShutdown(g_gdipToken);
+    if (mutex) { ReleaseMutex(mutex); CloseHandle(mutex); }
+    return 0;
+}
