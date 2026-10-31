@@ -1,26 +1,29 @@
 /* ============================================================================
- * AgentKeepAwake v4 —— 黑屏守护（液态玻璃 UI）
+ * AgentKeepAwake v4.4 —— 黑屏守护（液态玻璃 UI）
  * ============================================================================
  *
  * 目标：让 Trae / WorkBuddy / Qoder / DeepSeek 等 agent 继续跑，
- *       同时把显示器关掉（保护屏幕，避免长时间亮屏烧屏/耗电）。
+ *       同时让屏幕看起来是黑的（保护屏幕，避免长时间亮屏烧屏/耗电）。
  *
  * 做的事只有两件（可通过界面与日志核对）：
- *   1. 守护线程持有 SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED)
- *      —— 只阻止系统睡眠/休眠；线程级请求，不挂起、不限速任何进程。
- *   2. PostMessage(HWND_BROADCAST, WM_SYSCOMMAND, SC_MONITORPOWER, 2)
- *      —— 只关显示输出；CPU / 内存 / 磁盘 / 网络 / 进程调度完全不受影响。
+ *   1. 守护线程持有
+ *      SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED)
+ *      —— 系统和显示器都保持逻辑唤醒，避免 Windows 进入 Modern Standby
+ *         把普通桌面进程挂起；不挂起、不限速任何进程。
+ *   2. 在所有显示器上盖一层置顶、不抢焦点的纯黑窗口
+ *      —— 不发送 SC_MONITORPOWER、不关显示器电源（S0 机器上那会触发整机待机）。
  *
- * 唤醒：鼠标/键盘点亮显示器是硬件级行为，用户态拦不住；本程序在“无操作 N 秒”
- *       后自动重新关屏（默认 15 秒，可切 关/5/15/30）。你连续操作时不会打断你。
+ * 唤醒：鼠标移动/按键会立即撤掉黑屏；无操作 N 秒后自动再盖上（默认 15 秒，
+ *       可切 关/5/15/30）。锁屏、合盖、电源键、开始菜单睡眠仍由系统接管。
  *
  * UI：无边框异形窗口 + 逐像素 alpha + 桌面毛玻璃底 + 半透明玻璃卡片 + 动效，
- *     全部由 GDI+ 自绘；无任何第三方运行时。
+ *     全部由 GDI+ 自绘；无任何第三方运行时，不需要管理员权限。
  *
  * 构建（TDM-GCC / MinGW-w64 已验证）：
  *   windres res.rc -o res.o
- *   g++ -municode -mwindows -O2 -s AgentKeepAwake4.cpp res.o \
- *       -o AgentKeepAwake4.exe -lgdiplus -lgdi32 -luser32 -lshell32 -ladvapi32
+ *   g++ -municode -mwindows -O2 -s -fno-exceptions -fno-rtti -fno-threadsafe-statics \
+ *       AgentKeepAwake4.cpp res.o -o AgentKeepAwake.exe \
+ *       -lgdiplus -lgdi32 -luser32 -lshell32 -ladvapi32
  * ==========================================================================*/
 
 #define WIN32_LEAN_AND_MEAN
@@ -54,14 +57,16 @@ using namespace Gdiplus;
 #define APP_CLASS    L"AgentKeepAwakeGlassWnd"
 #define APP_TITLE    L"AgentKeepAwake · 黑屏守护"
 #define APP_NAME     L"AgentKeepAwake"
-#define APP_VER      L"v4.0"
+#define APP_VER      L"v4.4"
 
 #define WM_TRAY      (WM_USER + 10)
+#define WM_AKA_SHOW  (WM_USER + 11)   /* 第二个实例请求显示主窗口 */
+
+#define BLACK_CLASS  L"AgentKeepAwakeBlackOverlay"
 
 #define TIMER_UI     1
 #define TIMER_CLOCK  2
 #define TIMER_SCAN   3
-#define TIMER_MON    4     /* 关屏/亮屏指令的确认与回退 */
 
 /* Agent 名单容量：最多 24 条，界面同时显示 8 个 */
 #define AGENT_MAX    24
@@ -82,6 +87,9 @@ using namespace Gdiplus;
 #endif
 #ifndef ES_SYSTEM_REQUIRED
 #define ES_SYSTEM_REQUIRED  0x00000001
+#endif
+#ifndef ES_DISPLAY_REQUIRED
+#define ES_DISPLAY_REQUIRED 0x00000002
 #endif
 
 #define AKA_DEVICE_NOTIFY_WINDOW_HANDLE 0x00000000
@@ -154,21 +162,25 @@ static float g_press[B_COUNT];
 static BOOL  g_tracking;
 
 /* 运行状态 */
-static volatile LONG g_mode;           /* 0=关 1=防睡+黑屏 2=仅防睡 */
+static volatile LONG g_mode;           /* 0=关 1=黑屏+防睡 2=常亮防睡 */
 static int   g_prefMode = 1;           /* 下次启动用哪种模式 */
-static volatile LONG g_screenOff;
-static DWORD g_lastDispState = 1;      /* 系统通知的真实状态: 0关 1开 2变暗 */
-static DWORD g_monWant = 1;            /* 最近一次指令: 0=关 1=开 */
-static DWORD g_monAt;                  /* 指令发出时刻 */
-static BOOL  g_monConfirmed;           /* 本次指令是否已被系统通知证实 */
+static volatile LONG g_blackOn;        /* 纯黑遮罩是否正在显示 */
+static DWORD g_lastDispState = 1;      /* 系统通知的真实显示状态: 0关 1开 2变暗 */
+static DWORD g_blackAt;                /* 遮罩最近一次显示的时刻（防抖） */
 static int   g_reblackSec = 15;
 static ULONGLONG g_startTick;
 static int   g_protectSec;
 static float g_pulse;
 
+/* 黑屏遮罩 / 后台键盘唤醒 */
+static HWND g_blackWnd;
+static BOOL g_rawKb;
+
 /* 守护线程 */
 static HANDLE g_stopEvent;
 static HANDLE g_guardThread;
+static HANDLE g_guardReady;
+static volatile LONG g_guardOk;
 
 /* 显示器状态通知 */
 static HANDLE g_displayNotify;
@@ -267,6 +279,7 @@ static void LogMsg(const WCHAR *fmt, ...)
     WCHAR *p;
     FILE *fp;
     va_list ap;
+    SYSTEMTIME st;
 
     GetTempPathW(MAX_PATH, path);
     lstrcatW(path, L"AgentKeepAwake.log");
@@ -283,49 +296,194 @@ static void LogMsg(const WCHAR *fmt, ...)
         if (*p == L'\r' || *p == L'\n') *p = L' ';
         ++p;
     }
-    fwprintf(fp, L"[%lu] %ls\n", GetCurrentProcessId(), buf);
+    GetLocalTime(&st);
+    fwprintf(fp, L"[%04u-%02u-%02u %02u:%02u:%02u.%03u pid=%lu] %ls\n",
+             st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond,
+             st.wMilliseconds, GetCurrentProcessId(), buf);
     fclose(fp);
 }
 
 /* ---------------------------------------------------------------- 电源内核 */
 static DWORD WINAPI GuardThread(LPVOID)
 {
-    SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED);
-    LogMsg(L"guard: hold ES_CONTINUOUS|ES_SYSTEM_REQUIRED (no process is suspended)");
+    EXECUTION_STATE es;
 
-    while (WaitForSingleObject(g_stopEvent, 20000) == WAIT_TIMEOUT)
-        SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED);
+    /* ES_DISPLAY_REQUIRED 是关键：显示空闲计时器不再归零，Windows 不会因为
+     * “屏幕该关了”而进入 Modern Standby，桌面进程也就不会被 DAM 挂起。 */
+    es = SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED |
+                                 ES_DISPLAY_REQUIRED);
+    InterlockedExchange(&g_guardOk, es ? 1 : 0);
+    LogMsg(L"guard: hold ES_CONTINUOUS|ES_SYSTEM_REQUIRED|ES_DISPLAY_REQUIRED -> %ls",
+           es ? L"ok" : L"FAILED");
+    if (g_guardReady) SetEvent(g_guardReady);
+    if (!es) return 0;
+
+    while (WaitForSingleObject(g_stopEvent, 20000) == WAIT_TIMEOUT) {
+        es = SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED |
+                                     ES_DISPLAY_REQUIRED);
+        if (!es) LogMsg(L"guard: refresh FAILED");
+    }
 
     SetThreadExecutionState(ES_CONTINUOUS);
     LogMsg(L"guard: power request released");
     return 0;
 }
 
-/* 只关显示输出。
- * 先发给自己的窗口：DefWindowProc 执行 SC_MONITORPOWER，只走本进程这条消息，
- * 不广播 —— 广播会让百度网盘一类“锁屏监听”软件误弹“触发锁定失败”，
- * 打断用户正在跑的 agent。
- * 3 秒内收不到系统的“显示器已关”通知，才回退一次广播（兜底）。 */
-static void MonitorOff()
+/* ---------------------------------------------------------------- 黑屏遮罩
+ * 纯黑、置顶、不抢焦点、不在任务栏/Alt+Tab 出现，覆盖整个虚拟桌面。
+ * 不发送 SC_MONITORPOWER：在 Modern Standby (S0) 机器上那等于让整机待机，
+ * 桌面进程会被 DAM 挂起，agent 随之停摆。
+ * 遮罩会吃掉鼠标消息：任何移动/点击都会先撤掉它，避免在黑屏下误点到桌面。 */
+static void BlackFitToDesktop()
 {
-    InterlockedExchange(&g_screenOff, 1);
-    g_monWant = 0;
-    g_monAt = GetTickCount();
-    g_monConfirmed = FALSE;
-    PostMessageW(g_hwnd, WM_SYSCOMMAND, SC_MONITORPOWER, 2);
-    SetTimer(g_hwnd, TIMER_MON, 700, NULL);
-    LogMsg(L"screen: monitor-off posted (self)");
+    int x, y, w, h;
+
+    if (!g_blackWnd) return;
+    x = GetSystemMetrics(SM_XVIRTUALSCREEN);
+    y = GetSystemMetrics(SM_YVIRTUALSCREEN);
+    w = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+    h = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+    if (w <= 0 || h <= 0) {
+        x = 0; y = 0;
+        w = GetSystemMetrics(SM_CXSCREEN);
+        h = GetSystemMetrics(SM_CYSCREEN);
+    }
+    SetWindowPos(g_blackWnd, HWND_TOPMOST, x, y, w, h, SWP_NOACTIVATE);
 }
 
-static void MonitorOn()
+static void BlackEnsureWindow()
 {
-    InterlockedExchange(&g_screenOff, 0);
-    g_monWant = 1;
-    g_monAt = GetTickCount();
-    g_monConfirmed = FALSE;
-    PostMessageW(g_hwnd, WM_SYSCOMMAND, SC_MONITORPOWER, (LPARAM)-1);
-    SetTimer(g_hwnd, TIMER_MON, 700, NULL);
-    LogMsg(L"screen: monitor-on posted (self)");
+    int x, y, w, h;
+
+    if (g_blackWnd && IsWindow(g_blackWnd)) return;
+
+    x = GetSystemMetrics(SM_XVIRTUALSCREEN);
+    y = GetSystemMetrics(SM_YVIRTUALSCREEN);
+    w = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+    h = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+    if (w <= 0 || h <= 0) {
+        x = 0; y = 0;
+        w = GetSystemMetrics(SM_CXSCREEN);
+        h = GetSystemMetrics(SM_CYSCREEN);
+    }
+
+    g_blackWnd = CreateWindowExW(
+        WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+        BLACK_CLASS, L"", WS_POPUP,
+        x, y, w, h, NULL, NULL, g_inst, NULL);
+    if (!g_blackWnd)
+        LogMsg(L"black: CreateWindowEx failed (%lu)", GetLastError());
+}
+
+static void BlackShow(BOOL on)
+{
+    if (!on) {
+        if (g_blackWnd) ShowWindow(g_blackWnd, SW_HIDE);
+        if (InterlockedExchange(&g_blackOn, 0)) {
+            SetCursor(LoadCursorW(NULL, IDC_ARROW));
+            LogMsg(L"black: overlay OFF");
+        }
+        return;
+    }
+
+    BlackEnsureWindow();
+    if (!g_blackWnd) return;
+    if (InterlockedCompareExchange(&g_blackOn, 1, 0) != 0) return;
+
+    BlackFitToDesktop();
+    g_blackAt = GetTickCount();
+    SetWindowPos(g_blackWnd, HWND_TOPMOST, 0, 0, 0, 0,
+                 SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+    SetCursor(NULL);
+    LogMsg(L"black: overlay ON (virtual %d,%d %dx%d)",
+           GetSystemMetrics(SM_XVIRTUALSCREEN),
+           GetSystemMetrics(SM_YVIRTUALSCREEN),
+           GetSystemMetrics(SM_CXVIRTUALSCREEN),
+           GetSystemMetrics(SM_CYVIRTUALSCREEN));
+}
+
+static void BlackHideByInput(const WCHAR *why)
+{
+    if (!g_blackOn) return;
+    BlackShow(FALSE);
+    LogMsg(L"black: %ls -> overlay hidden", why);
+}
+
+static LRESULT CALLBACK BlackWndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
+{
+    switch (msg) {
+    case WM_ERASEBKGND:
+        return 1;
+
+    case WM_PAINT: {
+        PAINTSTRUCT ps;
+        HDC dc = BeginPaint(hwnd, &ps);
+        FillRect(dc, &ps.rcPaint, (HBRUSH)GetStockObject(BLACK_BRUSH));
+        EndPaint(hwnd, &ps);
+        return 0;
+    }
+
+    case WM_SETCURSOR:
+        SetCursor(NULL);
+        return TRUE;
+
+    case WM_MOUSEACTIVATE:
+        return MA_NOACTIVATE;
+
+    case WM_MOUSEMOVE:
+        /* 窗口刚出现时系统会补一条合成 mousemove，它不更新 GetLastInputInfo；
+         * 只有“确实有真实输入”才撤掉遮罩，避免刚盖黑就被自己唤醒。 */
+        if (GetTickCount() - g_blackAt >= 1500 && IdleMillis() < 1500)
+            BlackHideByInput(L"mouse");
+        return 0;
+
+    case WM_LBUTTONDOWN:
+    case WM_LBUTTONUP:
+    case WM_RBUTTONDOWN:
+    case WM_RBUTTONUP:
+    case WM_MBUTTONDOWN:
+    case WM_MBUTTONUP:
+        BlackHideByInput(L"mouse button");
+        return 0;
+
+    case WM_DISPLAYCHANGE:
+        BlackFitToDesktop();
+        return 0;
+
+    case WM_SYSCOMMAND:
+        if ((wp & 0xFFF0) == SC_MONITORPOWER) {
+            LogMsg(L"black: ignored external SC_MONITORPOWER");
+            return 0;
+        }
+        break;
+    }
+    return DefWindowProcW(hwnd, msg, wp, lp);
+}
+
+static void RegisterRawKeyboard()
+{
+    RAWINPUTDEVICE rid;
+
+    rid.usUsagePage = 0x01;   /* Generic Desktop */
+    rid.usUsage     = 0x06;   /* Keyboard */
+    rid.dwFlags     = RIDEV_INPUTSINK;
+    rid.hwndTarget  = g_hwnd;
+    g_rawKb = RegisterRawInputDevices(&rid, 1, sizeof(rid));
+    LogMsg(L"black: raw keyboard wake %ls", g_rawKb ? L"ok" : L"unavailable");
+}
+
+static void UnregisterRawKeyboard()
+{
+    RAWINPUTDEVICE rid;
+
+    if (!g_rawKb) return;
+    rid.usUsagePage = 0x01;
+    rid.usUsage     = 0x06;
+    rid.dwFlags     = RIDEV_REMOVE;
+    rid.hwndTarget  = NULL;
+    RegisterRawInputDevices(&rid, 1, sizeof(rid));
+    g_rawKb = FALSE;
+    LogMsg(L"black: raw keyboard wake released");
 }
 
 static void RegisterDisplayNotify(HWND hwnd)
@@ -542,6 +700,7 @@ static void ScanAgents()
 /* ---------------------------------------------------------------- 保护开关 */
 static void MarkDirty();
 static void UpdateTrayTip();
+static void StopProtection();
 
 static void HideToTray()
 {
@@ -554,6 +713,7 @@ static void HideToTray()
 
 static void ShowMain()
 {
+    if (g_blackOn) BlackShow(FALSE);
     ShowWindow(g_hwnd, SW_SHOW);
     ShowWindow(g_hwnd, SW_RESTORE);
     SetForegroundWindow(g_hwnd);
@@ -568,13 +728,38 @@ static void StartProtection(int mode)
     if (g_mode != 0) return;
 
     g_stopEvent = CreateEventW(NULL, TRUE, FALSE, NULL);
-    if (!g_stopEvent) { LogMsg(L"start: CreateEvent failed"); return; }
+    g_guardReady = CreateEventW(NULL, TRUE, FALSE, NULL);
+    if (!g_stopEvent || !g_guardReady) {
+        LogMsg(L"start: CreateEvent failed");
+        if (g_stopEvent) { CloseHandle(g_stopEvent); g_stopEvent = NULL; }
+        if (g_guardReady) { CloseHandle(g_guardReady); g_guardReady = NULL; }
+        return;
+    }
 
+    InterlockedExchange(&g_guardOk, 0);
     g_guardThread = CreateThread(NULL, 0, GuardThread, NULL, 0, NULL);
     if (!g_guardThread) {
-        CloseHandle(g_stopEvent);
-        g_stopEvent = NULL;
+        CloseHandle(g_stopEvent); g_stopEvent = NULL;
+        CloseHandle(g_guardReady); g_guardReady = NULL;
         LogMsg(L"start: CreateThread failed");
+        return;
+    }
+
+    /* 等守护线程真正拿到电源请求，再盖黑屏，避免“先黑后请求”的窗口期 */
+    WaitForSingleObject(g_guardReady, 3000);
+    CloseHandle(g_guardReady);
+    g_guardReady = NULL;
+
+    if (!g_guardOk) {
+        LogMsg(L"start: guard request not acquired, abort");
+        SetEvent(g_stopEvent);
+        WaitForSingleObject(g_guardThread, 3000);
+        CloseHandle(g_guardThread); g_guardThread = NULL;
+        CloseHandle(g_stopEvent); g_stopEvent = NULL;
+        MessageBoxW(g_hwnd,
+            L"系统没有接受防睡电源请求，守护未启动。\n\n"
+            L"请确认没有其他程序强制睡眠，然后重试。",
+            APP_NAME, MB_ICONWARNING);
         return;
     }
 
@@ -585,19 +770,35 @@ static void StartProtection(int mode)
 
     LogMsg(L"start: protection ON (mode=%d, reblack=%d)", mode, g_reblackSec);
 
-    /* 先刷新界面/托盘，再关屏：显示器进入待机时 explorer 响应会变慢 */
     UpdateTrayTip();
     HideToTray();
 
-    if (mode == 1) MonitorOff();
+    if (mode == 1) {
+        RegisterRawKeyboard();
+        BlackShow(TRUE);
+        if (!g_blackOn) {
+            LogMsg(L"start: black overlay failed, abort");
+            StopProtection();
+            MessageBoxW(g_hwnd,
+                L"无法创建黑屏遮罩窗口，守护未启动。",
+                APP_NAME, MB_ICONERROR);
+            return;
+        }
+    }
     MarkDirty();
 }
 
 static void StopProtection()
 {
-    if (g_mode == 0) return;
+    if (g_mode == 0) {
+        if (g_blackOn) BlackShow(FALSE);
+        return;
+    }
 
     KillTimer(g_hwnd, TIMER_CLOCK);
+    BlackShow(FALSE);
+    UnregisterRawKeyboard();
+
     if (g_stopEvent) SetEvent(g_stopEvent);
     if (g_guardThread) {
         WaitForSingleObject(g_guardThread, 3000);
@@ -612,8 +813,6 @@ static void StopProtection()
     g_protectSec = 0;
     LogMsg(L"stop: protection OFF");
 
-    if (g_screenOff) MonitorOn();
-
     ShowMain();
     UpdateTrayTip();
 }
@@ -622,36 +821,6 @@ static void ToggleProtection()
 {
     if (g_mode == 0) StartProtection(g_prefMode == 2 ? 2 : 1);
     else             StopProtection();
-}
-
-/* 深度防睡（仅托盘入口，需 UAC）：只改睡眠相关，绝不动“关闭显示器时间” */
-static void DeepConfig()
-{
-    static const WCHAR *params =
-        L"/c powercfg /setacvalueindex SCHEME_CURRENT 238c9fa8-0aad-41ed-83f4-97be242c8f20 29f6c1db-86da-48c5-9fdb-f2b67b1f44da 0"
-        L" && powercfg /setdcvalueindex SCHEME_CURRENT 238c9fa8-0aad-41ed-83f4-97be242c8f20 29f6c1db-86da-48c5-9fdb-f2b67b1f44da 0"
-        L" && powercfg /setacvalueindex SCHEME_CURRENT 238c9fa8-0aad-41ed-83f4-97be242c8f20 9d7815a6-7ee4-497e-8888-515a05f02364 0"
-        L" && powercfg /setdcvalueindex SCHEME_CURRENT 238c9fa8-0aad-41ed-83f4-97be242c8f20 9d7815a6-7ee4-497e-8888-515a05f02364 0"
-        L" && powercfg /setacvalueindex SCHEME_CURRENT 238c9fa8-0aad-41ed-83f4-97be242c8f20 7bc4a2f9-d8fc-4469-b07b-33eb785aaca0 0"
-        L" && powercfg /setacvalueindex SCHEME_CURRENT 4f971e89-eebd-4455-a8de-9e59040e7347 5ca83367-6e45-459f-a27b-476b1d01c936 0"
-        L" && powercfg /setdcvalueindex SCHEME_CURRENT 4f971e89-eebd-4455-a8de-9e59040e7347 5ca83367-6e45-459f-a27b-476b1d01c936 0"
-        L" && powercfg /hibernate off"
-        L" && powercfg /setactive SCHEME_CURRENT";
-
-    INT_PTR r = (INT_PTR)ShellExecuteW(g_hwnd, L"runas", L"cmd.exe",
-                                       (LPWSTR)params, NULL, SW_HIDE);
-    if (r <= 32) {
-        MessageBoxW(g_hwnd,
-            L"未能执行电源配置（可能取消了 UAC 授权）。\n\n"
-            L"普通使用不需要这项：守护本身已阻止系统睡眠。\n"
-            L"只有在合盖/无人值守仍会睡的环境才需要它。",
-            APP_NAME, MB_ICONINFORMATION);
-    } else {
-        MessageBoxW(g_hwnd,
-            L"已发送深度防睡配置（只改睡眠/休眠/合盖，不改关屏时间）。\n\n"
-            L"本操作不备份原值；要还原请用 powercfg 恢复默认方案。",
-            APP_NAME, MB_ICONINFORMATION);
-    }
 }
 
 /* ---------------------------------------------------------------- 托盘 */
@@ -682,15 +851,13 @@ static void UpdateTrayTip()
     HICON ic;
 
     if (!g_trayOk) return;
-    /* 屏幕关着时不要动 shell：explorer 重绘会把刚关掉的显示器点亮 */
-    if (g_screenOff && g_mode != 0) return;
 
     if (g_mode == 0)
         lstrcpynW(tip, L"AgentKeepAwake · 未开启", ARRAYSIZE(tip));
     else if (g_mode == 1)
-        lstrcpynW(tip, L"AgentKeepAwake · 守护中 · 屏幕已关闭", ARRAYSIZE(tip));
+        lstrcpynW(tip, L"AgentKeepAwake · 黑屏守护中", ARRAYSIZE(tip));
     else
-        lstrcpynW(tip, L"AgentKeepAwake · 防睡守护中 · 屏幕保持亮", ARRAYSIZE(tip));
+        lstrcpynW(tip, L"AgentKeepAwake · 常亮防睡中", ARRAYSIZE(tip));
 
     ic = (HICON)LoadImageW(g_inst, MAKEINTRESOURCEW(g_mode ? 2 : 1), IMAGE_ICON,
                            GetSystemMetrics(SM_CXSMICON),
@@ -708,11 +875,14 @@ static void ShowTrayMenu()
     HMENU m = CreatePopupMenu();
     POINT pt;
 
-    AppendMenuW(m, MF_STRING, 2001, g_mode ? L"停止守护" : L"开始息屏守护");
-    AppendMenuW(m, MF_STRING, 2002, L"立即熄屏");
+    if (g_mode == 0)
+        AppendMenuW(m, MF_STRING, 2001,
+                    g_prefMode == 2 ? L"开始常亮防睡" : L"开始黑屏守护");
+    else
+        AppendMenuW(m, MF_STRING, 2001, L"停止守护");
+    AppendMenuW(m, MF_STRING | (g_mode == 2 ? MF_GRAYED : 0), 2002, L"立即黑屏");
     AppendMenuW(m, MF_SEPARATOR, 0, NULL);
     AppendMenuW(m, MF_STRING, 2003, L"显示主窗口");
-    AppendMenuW(m, MF_STRING, 2004, L"深度防睡配置（管理员）…");
     AppendMenuW(m, MF_SEPARATOR, 0, NULL);
     AppendMenuW(m, MF_STRING, 2005, L"退出程序");
 
@@ -1152,7 +1322,7 @@ static void DrawMainButton(Graphics &g, BOOL active)
         g.FillPath(&hb, &p);
     }
 
-    Txt(g, active ? L"停止守护" : (g_prefMode == 2 ? L"开始防睡守护" : L"开始息屏守护"),
+    Txt(g, active ? L"停止守护" : (g_prefMode == 2 ? L"开始常亮防睡" : L"开始黑屏守护"),
         fBtn, r, active ? Color(255, 255, 250, 250) : C_DARKTXT, 1);
 }
 
@@ -1270,25 +1440,25 @@ static void PaintFrame()
 
         const WCHAR *title;
         if (g_mode == 0)              title = L"守护未开启";
-        else if (g_mode == 2)         title = L"防睡守护中";
-        else if (g_screenOff)         title = L"屏幕已熄灯";
-        else                          title = L"守护中 · 屏幕已亮";
+        else if (g_mode == 2)         title = L"常亮防睡中";
+        else if (g_blackOn)           title = L"屏幕已黑 · 任务照常跑";
+        else                          title = L"守护中 · 屏幕亮着";
 
         Txt(g, title, fStatus,
             RF(rHero.X + SCALE(108), rHero.Y + SCALE(36),
                rHero.Width - SCALE(128), SCALE(26)), C_TXT, 0);
 
         if (g_mode == 0)
-            lstrcpynW(buf, L"准备好后点一下，屏幕立刻关闭", ARRAYSIZE(buf));
+            lstrcpynW(buf, L"点一下，屏幕盖上一层纯黑，任务继续跑", ARRAYSIZE(buf));
         else if (g_mode == 2)
-            lstrcpynW(buf, L"系统不休眠 · 屏幕按 Windows 电源计划", ARRAYSIZE(buf));
-        else if (g_screenOff)
-            lstrcpynW(buf, L"任务继续运行 · 系统保持不休眠", ARRAYSIZE(buf));
+            lstrcpynW(buf, L"系统与屏幕保持唤醒 · 不会再自动熄屏", ARRAYSIZE(buf));
+        else if (g_blackOn)
+            lstrcpynW(buf, L"显示器只是被纯黑遮住 · agent 不会被挂起", ARRAYSIZE(buf));
         else {
             if (g_reblackSec > 0)
-                wsprintfW(buf, L"无操作 %d 秒后自动重新熄屏", g_reblackSec);
+                wsprintfW(buf, L"无操作 %d 秒后自动黑屏", g_reblackSec);
             else
-                lstrcpynW(buf, L"已停止自动重黑，由你手动控制", ARRAYSIZE(buf));
+                lstrcpynW(buf, L"自动黑屏已关闭，由你手动控制", ARRAYSIZE(buf));
         }
         Txt(g, buf, fStatusSub,
             RF(rHero.X + SCALE(109), rHero.Y + SCALE(66),
@@ -1304,9 +1474,11 @@ static void PaintFrame()
 
             DrawMetric(g, rHero.X + SCALE(22), my, L"已守护", dur,
                        g_mode ? C_TXT : C_TXT2);
-            DrawMetric(g, rHero.X + SCALE(172), my, L"显示器",
-                       g_screenOff ? L"关闭" : L"点亮",
-                       g_screenOff ? C_MINT : C_TXT2);
+            DrawMetric(g, rHero.X + SCALE(172), my, L"黑屏",
+                       g_mode == 0 ? L"—" :
+                       g_mode == 2 ? L"未启用" :
+                       g_blackOn ? L"已开启" : L"未开启",
+                       (g_mode == 1 && g_blackOn) ? C_MINT : C_TXT2);
             DrawMetric(g, rHero.X + SCALE(322), my, L"系统",
                        g_mode ? L"不休眠" : L"正常",
                        g_mode ? C_MINT : C_TXT3);
@@ -1321,13 +1493,13 @@ static void PaintFrame()
         DrawMainButton(g, g_mode != 0);
 
         if (g_mode == 0)
-            lstrcpynW(buf, g_prefMode == 2 ? L"防睡模式不关屏，适合需要看屏幕的场景"
-                                           : L"点一下立即熄屏 · 鼠标一动就亮回来",
+            lstrcpynW(buf, g_prefMode == 2 ? L"不黑屏，适合需要看屏幕的场景"
+                                           : L"点一下立即黑屏 · 动鼠标/按键就恢复",
                        ARRAYSIZE(buf));
         else if (g_mode == 2)
-            lstrcpynW(buf, L"不主动关屏 · 屏幕由系统设置决定", ARRAYSIZE(buf));
+            lstrcpynW(buf, L"屏幕保持常亮 · 由本程序阻止系统睡眠", ARRAYSIZE(buf));
         else
-            lstrcpynW(buf, L"全程只关显示输出 · Ctrl+Alt+K 可停止", ARRAYSIZE(buf));
+            lstrcpynW(buf, L"只盖一层纯黑窗口 · 不关显示器电源 · Ctrl+Alt+K 停止", ARRAYSIZE(buf));
 
         Txt(g, buf, fHint,
             RF(rHero.X + SCALE(18), rHero.Y + SCALE(212),
@@ -1403,14 +1575,14 @@ static void PaintFrame()
         }
 
         if (shown <= 4)
-            Txt(g, L"息屏期间它们照常运行：不挂起、不限速、不断网", fHint,
+            Txt(g, L"黑屏期间它们照常运行：不挂起、不限速、不断网", fHint,
                 rAgentsFoot, C_TXT4, 0);
     }
 
     /* ---------- 设置卡 ---------- */
     GlassCard(g, rSettings, (float)SCALE(20), 26);
     {
-        Txt(g, L"亮屏后自动再熄屏", fCardTitle, rSettingsRow1, C_TXT2, 0);
+        Txt(g, L"操作后自动再黑屏", fCardTitle, rSettingsRow1, C_TXT2, 0);
         Txt(g, L"守护模式", fCardTitle, rSettingsRow2, C_TXT2, 0);
 
         static const WCHAR *labels[4] = { L"关", L"5 秒", L"15 秒", L"30 秒" };
@@ -1418,8 +1590,8 @@ static void PaintFrame()
         for (int i = 0; i < 4; ++i)
             DrawPill(g, rRb[i], g_reblackSec == vals[i], g_hover[B_RB0 + i], labels[i]);
 
-        DrawPill(g, rMd[0], g_prefMode == 1, g_hover[B_MD0], L"息屏 + 防睡");
-        DrawPill(g, rMd[1], g_prefMode == 2, g_hover[B_MD1], L"仅防睡");
+        DrawPill(g, rMd[0], g_prefMode == 1, g_hover[B_MD0], L"黑屏 + 防睡");
+        DrawPill(g, rMd[1], g_prefMode == 2, g_hover[B_MD1], L"常亮防睡");
     }
 
     /* ---------- 页脚 ---------- */
@@ -1633,54 +1805,55 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
             if (g_mode != 0)
                 g_protectSec = (int)((GetTickCount64() - g_startTick) / 1000);
 
-            /* 只有「息屏 + 防睡」模式才自动关屏；仅防睡模式绝不碰显示器 */
-            if (g_mode == 1 && !g_screenOff && g_reblackSec > 0) {
-                DWORD idle = IdleMillis();
-                if (idle >= (DWORD)g_reblackSec * 1000) {
-                    LogMsg(L"reblack: idle=%lu ms -> off", idle);
-                    MonitorOff();
-                    UpdateTrayTip();
+            /* 黑屏模式下：有真实输入就撤掉遮罩；空闲够久再盖上 */
+            if (g_mode == 1) {
+                if (g_blackOn) {
+                    /* 刚盖上时留 1.5 秒防抖，避免启动时的合成输入误唤醒 */
+                    if (GetTickCount() - g_blackAt >= 1500 && IdleMillis() < 1500)
+                        BlackHideByInput(L"idle");
+                } else if (g_reblackSec > 0) {
+                    DWORD idle = IdleMillis();
+                    if (idle >= (DWORD)g_reblackSec * 1000) {
+                        LogMsg(L"reblack: idle=%lu ms -> black", idle);
+                        BlackShow(TRUE);
+                    }
                 }
             }
             MarkDirty();
         } else if (wp == TIMER_SCAN) {
             ScanAgents();
             MarkDirty();
-        } else if (wp == TIMER_MON) {
-            /* 自发指令 3 秒仍未被系统通知证实 -> 回退一次广播（兜底，极少用到） */
-            if (GetTickCount() - g_monAt >= 3000) {
-                if (g_monConfirmed) {
-                    LogMsg(L"screen: %ls confirmed (state=%lu)",
-                           g_monWant ? L"on" : L"off", g_lastDispState);
-                } else if (g_monWant == 0 && g_lastDispState != 0) {
-                    PostMessageW(HWND_BROADCAST, WM_SYSCOMMAND, SC_MONITORPOWER, 2);
-                    LogMsg(L"screen: off not confirmed, fallback broadcast");
-                } else if (g_monWant == 1 && g_lastDispState == 0) {
-                    PostMessageW(HWND_BROADCAST, WM_SYSCOMMAND, SC_MONITORPOWER, (LPARAM)-1);
-                    LogMsg(L"screen: on not confirmed, fallback broadcast");
-                } else {
-                    LogMsg(L"screen: %ls confirmed (state=%lu)",
-                           g_monWant ? L"on" : L"off", g_lastDispState);
-                }
-                KillTimer(hwnd, TIMER_MON);
-            }
-            return 0;
         }
         return 0;
 
+    case WM_INPUT:
+        /* RIDEV_INPUTSINK 只用来“知道有按键”，不拦截、不记录内容 */
+        if (g_blackOn) BlackHideByInput(L"keyboard");
+        return DefWindowProcW(hwnd, msg, wp, lp);
+
     case WM_POWERBROADCAST:
+        if (wp == PBT_APMSUSPEND) {
+            LogMsg(L"power: PBT_APMSUSPEND (entering sleep/Modern Standby)");
+            return TRUE;
+        }
+        if (wp == PBT_APMRESUMESUSPEND || wp == PBT_APMRESUMEAUTOMATIC) {
+            LogMsg(L"power: resume");
+            if (g_blackOn) {
+                BlackFitToDesktop();
+                SetWindowPos(g_blackWnd, HWND_TOPMOST, 0, 0, 0, 0,
+                             SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+            }
+            return TRUE;
+        }
         if (wp == PBT_POWERSETTINGCHANGE && lp) {
             PBS_AKA *pbs = (PBS_AKA *)lp;
             if (pbs->DataLength >= 4 &&
                 memcmp(&pbs->PowerSetting, &GUID_DISPLAY_STATE, sizeof(GUID)) == 0) {
                 DWORD st = *(DWORD *)pbs->Data;
                 g_lastDispState = st;
-                /* 只有“关屏收到 0 / 亮屏收到非 0”才算本次指令生效 */
-                if ((g_monWant == 0 && st == 0) || (g_monWant == 1 && st != 0))
-                    g_monConfirmed = TRUE;
-                InterlockedExchange(&g_screenOff, st == 0 ? 1 : 0);
                 LogMsg(L"display: state=%lu", st);
-                /* 这里只改状态；绝不调用 shell API，避免 explorer 重绘把屏幕点亮 */
+                if (st == 0 && g_mode != 0)
+                    LogMsg(L"display: WARNING OS turned display off; agents may be suspended");
                 MarkDirty();
             }
         }
@@ -1689,6 +1862,19 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_HOTKEY:
         if (wp == 1) ToggleProtection();
         return 0;
+
+    case WM_AKA_SHOW:
+        ShowMain();
+        return 0;
+
+    case WM_SYSCOMMAND:
+        /* 别的软件广播关屏时，至少别让本窗口跟着执行 */
+        if (g_mode != 0 &&
+            ((wp & 0xFFF0) == SC_MONITORPOWER || (wp & 0xFFF0) == SC_SCREENSAVE)) {
+            LogMsg(L"screen: ignored external SC_MONITORPOWER/SC_SCREENSAVE");
+            return 0;
+        }
+        break;
 
     case WM_TRAY: {
         WORD ev = LOWORD(lp);
@@ -1703,9 +1889,11 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
     case WM_COMMAND:
         switch (LOWORD(wp)) {
         case 2001: ToggleProtection(); break;
-        case 2002: MonitorOff(); break;   /* 只熄屏，不改变守护状态 */
+        case 2002:
+            if (g_mode == 0) StartProtection(1);
+            else if (g_mode == 1) BlackShow(TRUE);
+            break;
         case 2003: ShowMain(); break;
-        case 2004: DeepConfig(); break;
         case 2005: PostMessageW(hwnd, WM_CLOSE, 0, 0); break;
         }
         return 0;
@@ -1736,7 +1924,13 @@ static void CleanupAndExit(HWND hwnd)
     KillTimer(hwnd, TIMER_UI);
     KillTimer(hwnd, TIMER_CLOCK);
     KillTimer(hwnd, TIMER_SCAN);
-    KillTimer(hwnd, TIMER_MON);
+
+    BlackShow(FALSE);
+    UnregisterRawKeyboard();
+    if (g_blackWnd) {
+        DestroyWindow(g_blackWnd);
+        g_blackWnd = NULL;
+    }
 
     if (g_trayOk) {
         Shell_NotifyIconW(NIM_DELETE, &g_nid);
@@ -1770,7 +1964,8 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrev, LPWSTR cmd, int show)
     if (GetLastError() == ERROR_ALREADY_EXISTS) {
         HWND old = FindWindowW(APP_CLASS, NULL);
         if (old) {
-            ShowWindow(old, SW_SHOW);
+            /* 让旧实例先撤掉黑屏遮罩，再显示主窗口 */
+            PostMessageW(old, WM_AKA_SHOW, 0, 0);
             SetForegroundWindow(old);
         }
         return 0;
@@ -1800,6 +1995,19 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrev, LPWSTR cmd, int show)
     if (!RegisterClassExW(&wc)) {
         LogMsg(L"RegisterClassEx failed (%lu)", GetLastError());
         return 1;
+    }
+
+    {
+        WNDCLASSEXW bc;
+        ZeroMemory(&bc, sizeof(bc));
+        bc.cbSize = sizeof(bc);
+        bc.lpfnWndProc = BlackWndProc;
+        bc.hInstance = hInstance;
+        bc.hCursor = LoadCursorW(NULL, IDC_ARROW);
+        bc.hbrBackground = (HBRUSH)GetStockObject(BLACK_BRUSH);
+        bc.lpszClassName = BLACK_CLASS;
+        if (!RegisterClassExW(&bc))
+            LogMsg(L"black: RegisterClassEx failed (%lu)", GetLastError());
     }
 
     InitCanvas();
@@ -1845,6 +2053,12 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrev, LPWSTR cmd, int show)
     }
 
     LogMsg(L"=== AgentKeepAwake exit ===");
+
+    if (g_blackWnd) {
+        DestroyWindow(g_blackWnd);
+        g_blackWnd = NULL;
+    }
+    UnregisterClassW(BLACK_CLASS, hInstance);
 
     /* GDI+ 对象必须在 GdiplusShutdown 之前销毁 */
     delete g_canvas;    g_canvas = NULL;
