@@ -37,7 +37,7 @@ if errorlevel 1 goto :nosrc
 "%WINDRES%" res.rc -o res.o
 if errorlevel 1 goto :err
 
-"%GXX%" -municode -mwindows -O2 -s -fno-exceptions -fno-rtti -fno-threadsafe-statics AgentKeepAwake4.cpp res.o -o AgentKeepAwake.exe -lgdiplus -lgdi32 -luser32 -lshell32 -ladvapi32
+"%GXX%" -municode -mwindows -O2 -s -fno-exceptions -fno-rtti -fno-threadsafe-statics AgentKeepAwake4.cpp res.o -o AgentKeepAwake.exe -lgdiplus -lgdi32 -luser32 -lshell32 -ladvapi32 -lole32 -loleaut32 -lwbemuuid
 if errorlevel 1 goto :err
 
 del res.o >nul 2>nul

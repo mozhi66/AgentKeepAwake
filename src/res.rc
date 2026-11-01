@@ -3,8 +3,8 @@
 1 24 "manifest.xml"
 
 1 VERSIONINFO
-FILEVERSION 4,4,0,0
-PRODUCTVERSION 4,4,0,0
+FILEVERSION 4,5,0,0
+PRODUCTVERSION 4,5,0,0
 FILEOS 0x40004
 FILETYPE 0x1
 BEGIN
@@ -13,12 +13,12 @@ BEGIN
     BLOCK "080404B0"
     BEGIN
       VALUE "CompanyName", "AgentKeepAwake"
-      VALUE "FileDescription", "AgentKeepAwake - black-screen keep-awake for long-running agents"
-      VALUE "FileVersion", "4.4.0.0"
+      VALUE "FileDescription", "AgentKeepAwake - black-screen keep-awake with screenshot peek for long-running agents"
+      VALUE "FileVersion", "4.5.0.0"
       VALUE "InternalName", "AgentKeepAwake4"
       VALUE "OriginalFilename", "AgentKeepAwake4.exe"
       VALUE "ProductName", "AgentKeepAwake"
-      VALUE "ProductVersion", "4.4.0.0"
+      VALUE "ProductVersion", "4.5.0.0"
     END
   END
   BLOCK "VarFileInfo"

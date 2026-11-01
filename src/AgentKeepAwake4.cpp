@@ -1,17 +1,21 @@
 /* ============================================================================
- * AgentKeepAwake v4.4 —— 黑屏守护（液态玻璃 UI）
+ * AgentKeepAwake v4.5 —— 黑屏守护（液态玻璃 UI）
  * ============================================================================
  *
  * 目标：让 Trae / WorkBuddy / Qoder / DeepSeek 等 agent 继续跑，
  *       同时让屏幕看起来是黑的（保护屏幕，避免长时间亮屏烧屏/耗电）。
  *
- * 做的事只有两件（可通过界面与日志核对）：
+ * 做的事：
  *   1. 守护线程持有
  *      SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED)
  *      —— 系统和显示器都保持逻辑唤醒，避免 Windows 进入 Modern Standby
  *         把普通桌面进程挂起；不挂起、不限速任何进程。
  *   2. 在所有显示器上盖一层置顶、不抢焦点的纯黑窗口
  *      —— 不发送 SC_MONITORPOWER、不关显示器电源（S0 机器上那会触发整机待机）。
+ *   3. 黑屏期间通过 WMI 把内置屏背光压到最低（可关），撤幕/退出时恢复；
+ *      —— 只是背光，不改画面内容，不改变电源状态，普通权限即可调用。
+ *   4. `AgentKeepAwake.exe --peek [秒]`：给截屏型 agent 用的接口，
+ *      临时撤幕（并可恢复亮度）若干秒，超时自动再黑。截屏期间不重黑。
  *
  * 唤醒：鼠标移动/按键会立即撤掉黑屏；无操作 N 秒后自动再盖上（默认 15 秒，
  *       可切 关/5/15/30）。锁屏、合盖、电源键、开始菜单睡眠仍由系统接管。
@@ -23,7 +27,7 @@
  *   windres res.rc -o res.o
  *   g++ -municode -mwindows -O2 -s -fno-exceptions -fno-rtti -fno-threadsafe-statics \
  *       AgentKeepAwake4.cpp res.o -o AgentKeepAwake.exe \
- *       -lgdiplus -lgdi32 -luser32 -lshell32 -ladvapi32
+ *       -lgdiplus -lgdi32 -luser32 -lshell32 -ladvapi32 -lole32 -loleaut32 -lwbemuuid
  * ==========================================================================*/
 
 #define WIN32_LEAN_AND_MEAN
@@ -37,10 +41,14 @@
 #ifndef _WIN32_WINNT
 #define _WIN32_WINNT 0x0601
 #endif
+#ifndef _WIN32_DCOM
+#define _WIN32_DCOM
+#endif
 
 #include <windows.h>
 #include <windowsx.h>
 #include <objidl.h>
+#include <wbemidl.h>
 #include <shellapi.h>
 #include <tlhelp32.h>
 #include <gdiplus.h>
@@ -57,10 +65,11 @@ using namespace Gdiplus;
 #define APP_CLASS    L"AgentKeepAwakeGlassWnd"
 #define APP_TITLE    L"AgentKeepAwake · 黑屏守护"
 #define APP_NAME     L"AgentKeepAwake"
-#define APP_VER      L"v4.4"
+#define APP_VER      L"v4.5"
 
 #define WM_TRAY      (WM_USER + 10)
 #define WM_AKA_SHOW  (WM_USER + 11)   /* 第二个实例请求显示主窗口 */
+#define WM_AKA_PEEK  (WM_USER + 12)   /* 截屏前临时亮屏，wParam = 秒 */
 
 #define BLACK_CLASS  L"AgentKeepAwakeBlackOverlay"
 
@@ -75,7 +84,7 @@ using namespace Gdiplus;
 
 /* 逻辑像素（96 DPI 下的设计稿），运行时按 DPI 缩放 */
 #define PANEL_W      520
-#define PANEL_H      610
+#define PANEL_H      656
 #define SHADOW_M     30      /* 四周留给投影的透明边距 */
 #define PAD          22
 
@@ -128,6 +137,7 @@ enum {
     B_EXIT,
     B_RB0, B_RB1, B_RB2, B_RB3,
     B_MD0, B_MD1,
+    B_BR0, B_BR1,
     B_COUNT
 };
 
@@ -151,8 +161,9 @@ static Font *fName, *fSub, *fStatus, *fStatusSub, *fMetricL, *fMetricV,
 
 /* 布局（像素，面板坐标系） */
 static RectF rPanel, rHero, rMain, rBtnMin, rBtnClose, rBtnExit,
-             rAgents, rSettings, rRb[4], rMd[2], rChip[AGENT_CHIPS], rSettingsRow1,
-             rSettingsRow2, rAgentHint, rAgentsFoot;
+             rAgents, rSettings, rRb[4], rMd[2], rBr[2], rChip[AGENT_CHIPS],
+             rSettingsRow1,
+             rSettingsRow2, rSettingsRow3, rPeekHint, rAgentHint, rAgentsFoot;
 
 /* 交互 */
 static int   g_hoverId = B_NONE;
@@ -175,6 +186,23 @@ static float g_pulse;
 /* 黑屏遮罩 / 后台键盘唤醒 */
 static HWND g_blackWnd;
 static BOOL g_rawKb;
+
+/* 截屏窗口（peek）：遮住的时间点之前不再自动再黑 */
+static DWORD g_peekUntil;
+static int   g_peekSec = 3;
+
+/* 背光（WMI root\WMI：只调内置屏背光，不关显示器、不改电源状态） */
+static int   g_blackBright = 1;        /* 1=黑屏时把背光压到最低 */
+static volatile LONG g_brightAvail;    /* 1=本机有可调背光 */
+static volatile LONG g_brightWant;     /* -1=恢复用户亮度，>=0=目标档 */
+static volatile LONG g_brightApplied = -1000;
+static LONG    g_brightUser = -1;      /* 压低之前的用户亮度，用于恢复 */
+static HANDLE  g_brightEvent;
+static HANDLE  g_brightThread;
+static volatile LONG g_brightStop;
+static CRITICAL_SECTION g_brightCs;
+static IWbemServices *g_wmiSvc;
+static BOOL    g_wmiDead;
 
 /* 守护线程 */
 static HANDLE g_stopEvent;
@@ -303,6 +331,348 @@ static void LogMsg(const WCHAR *fmt, ...)
     fclose(fp);
 }
 
+/* ---------------------------------------------------------------- 背光（WMI）
+ * 只调内置屏背光档位：不关显示器、不发 SC_MONITORPOWER、不改任何电源状态，
+ * 普通用户权限即可调用。所有 WMI 调用都在独立线程里做，UI 不卡。
+ * 本机没有可调背光（台式机/外接屏/驱动不支持）时自动降级为空操作。 */
+#define BRIGHT_RESTORE (-1)        /* 恢复用户原来的档位 */
+#define BRIGHT_NONE    (-1000)     /* 没有待处理请求 */
+#define BRIGHT_MIN     0           /* 压到最低档 */
+
+static BOOL BrightReadDw(const WCHAR *name, DWORD *out)
+{
+    HKEY k;
+    DWORD sz = sizeof(DWORD), t = 0;
+    BOOL ok = FALSE;
+
+    if (RegOpenKeyExW(HKEY_CURRENT_USER, L"Software\\AgentKeepAwake", 0,
+                      KEY_READ, &k) != ERROR_SUCCESS) return FALSE;
+    if (RegQueryValueExW(k, name, NULL, &t, (BYTE *)out, &sz) == ERROR_SUCCESS &&
+        t == REG_DWORD) ok = TRUE;
+    RegCloseKey(k);
+    return ok;
+}
+
+static void BrightWriteDw(const WCHAR *name, DWORD v)
+{
+    HKEY k;
+    DWORD d;
+
+    if (RegCreateKeyExW(HKEY_CURRENT_USER, L"Software\\AgentKeepAwake", 0, NULL, 0,
+                        KEY_WRITE, NULL, &k, &d) != ERROR_SUCCESS) return;
+    RegSetValueExW(k, name, 0, REG_DWORD, (const BYTE *)&v, sizeof(v));
+    RegCloseKey(k);
+}
+
+static BOOL BrightConnect(void)
+{
+    HRESULT hr;
+    IWbemLocator *loc = NULL;
+    BSTR ns;
+
+    if (g_wmiSvc) return TRUE;
+    if (g_wmiDead) return FALSE;
+
+    ns = SysAllocString(L"root\\WMI");
+    hr = CoCreateInstance(CLSID_WbemLocator, NULL, CLSCTX_INPROC_SERVER,
+                          IID_IWbemLocator, (LPVOID *)&loc);
+    if (SUCCEEDED(hr) && loc)
+        hr = loc->ConnectServer(ns, NULL, NULL, NULL, 0, NULL, NULL, &g_wmiSvc);
+    if (loc) loc->Release();
+    SysFreeString(ns);
+
+    if (FAILED(hr) || !g_wmiSvc) {
+        g_wmiSvc = NULL;
+        g_wmiDead = TRUE;
+        LogMsg(L"bright: WMI connect failed (0x%08lX)", (unsigned long)hr);
+        return FALSE;
+    }
+    hr = CoSetProxyBlanket(g_wmiSvc, RPC_C_AUTHN_WINNT, RPC_C_AUTHZ_NONE, NULL,
+                           RPC_C_AUTHN_LEVEL_CALL, RPC_C_IMP_LEVEL_IMPERSONATE,
+                           NULL, EOAC_NONE);
+    if (FAILED(hr)) {
+        g_wmiSvc->Release();
+        g_wmiSvc = NULL;
+        g_wmiDead = TRUE;
+        LogMsg(L"bright: proxy blanket failed (0x%08lX)", (unsigned long)hr);
+        return FALSE;
+    }
+    return TRUE;
+}
+
+static void BrightDisconnect(void)
+{
+    if (g_wmiSvc) {
+        g_wmiSvc->Release();
+        g_wmiSvc = NULL;
+    }
+}
+
+/* 读当前背光档（0-100） */
+static BOOL BrightGetLevel(LONG *out)
+{
+    BSTR lang = NULL, wql = NULL;
+    IEnumWbemClassObject *en = NULL;
+    IWbemClassObject *obj = NULL;
+    VARIANT v;
+    ULONG got = 0;
+    BOOL ok = FALSE;
+    HRESULT hr;
+
+    lang = SysAllocString(L"WQL");
+    wql = SysAllocString(L"select CurrentBrightness from WmiMonitorBrightness");
+    hr = g_wmiSvc->ExecQuery(lang, wql,
+                             WBEM_FLAG_FORWARD_ONLY | WBEM_FLAG_RETURN_IMMEDIATELY,
+                             NULL, &en);
+    SysFreeString(wql);
+    SysFreeString(lang);
+    if (FAILED(hr) || !en) return FALSE;
+
+    if (SUCCEEDED(en->Next(WBEM_INFINITE, 1, &obj, &got)) && got == 1 && obj) {
+        VariantInit(&v);
+        if (SUCCEEDED(obj->Get(L"CurrentBrightness", 0, &v, NULL, NULL))) {
+            if (v.vt == VT_UI1)      { *out = (LONG)v.bVal;  ok = TRUE; }
+            else if (v.vt == VT_I2)  { *out = (LONG)v.iVal;  ok = TRUE; }
+            else if (v.vt == VT_I4)  { *out = (LONG)v.lVal;  ok = TRUE; }
+            else if (v.vt == VT_UI4) { *out = (LONG)v.ulVal; ok = TRUE; }
+        }
+        VariantClear(&v);
+        obj->Release();
+    }
+    en->Release();
+    return ok;
+}
+
+/* 给每个 WmiMonitorBrightnessMethods 实例调用 WmiSetBrightness(Timeout, Brightness) */
+static BOOL BrightSetLevel(int level)
+{
+    BSTR lang = NULL, wql = NULL, clsName = NULL, meth = NULL;
+    IEnumWbemClassObject *en = NULL;
+    IWbemClassObject *inst = NULL, *cls = NULL, *sig = NULL, *prm = NULL;
+    VARIANT vt;
+    ULONG got = 0;
+    int done = 0;
+    BOOL ok = FALSE;
+    HRESULT hr;
+    if (level < 0) level = 0;
+    if (level > 100) level = 100;
+
+    lang = SysAllocString(L"WQL");
+    wql = SysAllocString(L"select * from WmiMonitorBrightnessMethods");
+    hr = g_wmiSvc->ExecQuery(lang, wql,
+                             WBEM_FLAG_FORWARD_ONLY | WBEM_FLAG_RETURN_IMMEDIATELY,
+                             NULL, &en);
+    SysFreeString(wql);
+    if (FAILED(hr) || !en) {
+        LogMsg(L"bright: 查询 Methods 失败 (0x%08lX)", (unsigned long)hr);
+        SysFreeString(lang);
+        return FALSE;
+    }
+
+    clsName = SysAllocString(L"WmiMonitorBrightnessMethods");
+    meth = SysAllocString(L"WmiSetBrightness");
+    /* GetMethod 的第三个参数本身就是 InParameters 定义，直接 SpawnInstance */
+    hr = g_wmiSvc->GetObject(clsName, 0, NULL, &cls, NULL);
+    if (FAILED(hr)) LogMsg(L"bright: GetObject 失败 (0x%08lX)", (unsigned long)hr);
+    if (SUCCEEDED(hr) && cls) {
+        hr = cls->GetMethod(meth, 0, &sig, NULL);
+        if (FAILED(hr)) LogMsg(L"bright: GetMethod 失败 (0x%08lX)", (unsigned long)hr);
+        if (SUCCEEDED(hr) && sig) {
+            hr = sig->SpawnInstance(0, &prm);
+            if (FAILED(hr)) { LogMsg(L"bright: SpawnInstance 失败 (0x%08lX)",
+                                     (unsigned long)hr); prm = NULL; }
+        }
+    }
+    if (!prm) goto done_out;
+
+    VariantInit(&vt);
+    vt.vt = VT_UI1; vt.bVal = (UCHAR)level;
+    hr = prm->Put(L"Brightness", 0, &vt, CIM_UINT8);
+    if (FAILED(hr)) LogMsg(L"bright: Put Brightness 失败 (0x%08lX)", (unsigned long)hr);
+    VariantInit(&vt);
+    /* Timeout 是 CIM_UINT32，但本机 WMI 只接受 VT_I4 承载（用 VT_UI4 会报
+       WBEM_E_TYPE_MISMATCH 0x80041005）——实测结论，别改回去 */
+    vt.vt = VT_I4; vt.lVal = 0;                   /* 0 = 立即生效 */
+    hr = prm->Put(L"Timeout", 0, &vt, CIM_UINT32);
+    if (FAILED(hr)) LogMsg(L"bright: Put Timeout 失败 (0x%08lX)", (unsigned long)hr);
+
+    while (en->Next(WBEM_INFINITE, 1, &inst, &got) == WBEM_S_NO_ERROR && got == 1) {
+        VARIANT vp;
+        if (!inst) break;
+        VariantInit(&vp);
+        if (SUCCEEDED(inst->Get(L"__PATH", 0, &vp, NULL, NULL)) && vp.vt == VT_BSTR) {
+            hr = g_wmiSvc->ExecMethod(vp.bstrVal, meth, 0, NULL, prm, NULL, NULL);
+            if (SUCCEEDED(hr)) ++done;
+            else LogMsg(L"bright: WmiSetBrightness failed (0x%08lX) path=%ls",
+                        (unsigned long)hr, vp.bstrVal ? vp.bstrVal : L"(null)");
+        } else {
+            LogMsg(L"bright: 实例没有 __PATH (vt=%d)", (int)vp.vt);
+        }
+        VariantClear(&vp);
+        inst->Release();
+        inst = NULL;
+    }
+    ok = done > 0;
+    if (!ok) LogMsg(L"bright: 没有可用的背光控制实例（枚举到 %d 个）", got);
+
+done_out:
+    if (prm) prm->Release();
+    if (sig) sig->Release();
+    if (cls) cls->Release();
+    SysFreeString(meth);
+    SysFreeString(clsName);
+    en->Release();
+    SysFreeString(lang);
+    return ok;
+}
+
+/* 记住“是我们把背光压低的”，程序被强杀后下次启动能自动恢复 */
+static void BrightMark(int zeroed)
+{
+    if (zeroed) {
+        if (g_brightUser >= 0) BrightWriteDw(L"UserBright", (DWORD)g_brightUser);
+        BrightWriteDw(L"BrightZeroed", 1);
+    } else {
+        BrightWriteDw(L"BrightZeroed", 0);
+    }
+}
+
+/* 必须在 g_brightCs 内调用。g_brightApplied：>=0 表示我们压到了该档，-1 表示已恢复 */
+static BOOL BrightApply(LONG want)
+{
+    LONG target;
+
+    if (want >= 0 && !g_blackBright) return FALSE;
+    if (want < 0 && (LONG)g_brightApplied < 0) return FALSE;
+    if (g_brightAvail < 0) return FALSE;         /* 探测过：本机没有可调背光 */
+    if (!BrightConnect()) return FALSE;
+
+    if (g_brightUser < 0 && !BrightGetLevel(&g_brightUser)) {
+        LogMsg(L"bright: 读不到当前背光档，跳过");
+        return FALSE;
+    }
+
+    target = (want < 0) ? g_brightUser : want;
+    if (!BrightSetLevel((int)target)) return FALSE;
+
+    InterlockedExchange(&g_brightApplied, want);
+    BrightMark(want >= 0 ? 1 : 0);
+    LogMsg(L"bright: 背光 -> %ld 档（%ls，用户档 %ld）",
+           target, want >= 0 ? L"黑屏压到最低" : L"恢复用户亮度", g_brightUser);
+    return TRUE;
+}
+
+/* 连一次 WMI，确认本机有没有可调背光，并记下用户当前档位 */
+static void BrightProbe(void)
+{
+    LONG cur = -1;
+    BOOL ok = FALSE;
+
+    EnterCriticalSection(&g_brightCs);
+    if (BrightConnect() && BrightGetLevel(&cur)) ok = TRUE;
+    LeaveCriticalSection(&g_brightCs);
+
+    if (ok) {
+        if (g_brightUser < 0) g_brightUser = cur;   /* 崩溃恢复时已带上次的值，不覆盖 */
+        InterlockedExchange(&g_brightAvail, 1);
+        LogMsg(L"bright: panel ok (level=%ld, 将恢复=%ld)", cur, g_brightUser);
+    } else {
+        InterlockedExchange(&g_brightAvail, -1);
+        LogMsg(L"bright: 本机没有可调背光（外接屏或驱动不支持），只用纯黑遮罩");
+    }
+}
+
+static DWORD WINAPI BrightThread(LPVOID)
+{
+    CoInitializeEx(NULL, COINIT_MULTITHREADED);
+    BrightProbe();
+
+    for (;;) {
+        LONG want;
+
+        if (WaitForSingleObject(g_brightEvent, INFINITE) != WAIT_OBJECT_0) break;
+        if (g_brightStop) break;
+
+        want = (LONG)InterlockedExchange(&g_brightWant, BRIGHT_NONE);
+        if (want == BRIGHT_NONE || (LONG)g_brightApplied == want) continue;
+
+        EnterCriticalSection(&g_brightCs);
+        if (BrightApply(want)) InterlockedExchange(&g_brightAvail, 1);
+        else if (g_wmiDead)    InterlockedExchange(&g_brightAvail, -1);
+        LeaveCriticalSection(&g_brightCs);
+    }
+
+    BrightDisconnect();
+    CoUninitialize();
+    return 0;
+}
+
+static void BrightAsk(LONG want)
+{
+    if (!g_brightEvent) return;
+    InterlockedExchange(&g_brightWant, want);
+    SetEvent(g_brightEvent);
+}
+
+static void BrightStart(void)
+{
+    DWORD v = 0;
+    LONG saved = -1;
+
+    InitializeCriticalSection(&g_brightCs);
+
+    /* 上次没来得及恢复（被强杀/断电）：这次启动先补回来 */
+    if (BrightReadDw(L"BrightZeroed", &v) && v == 1 &&
+        BrightReadDw(L"UserBright", &v) && v >= 0 && v <= 100) {
+        saved = (LONG)v;
+    }
+    if (saved >= 0) {
+        g_brightUser = saved;
+        InterlockedExchange(&g_brightApplied, 0);   /* 标记“被压低过”，触发恢复 */
+        LogMsg(L"bright: 上次异常退出，恢复背光到 %ld", saved);
+    }
+
+    g_brightEvent = CreateEventW(NULL, FALSE, FALSE, NULL);
+    if (!g_brightEvent) return;
+
+    g_brightThread = CreateThread(NULL, 0, BrightThread, NULL, 0, NULL);
+    if (!g_brightThread) {
+        CloseHandle(g_brightEvent);
+        g_brightEvent = NULL;
+        return;
+    }
+    if (saved >= 0) BrightAsk(BRIGHT_RESTORE);
+}
+
+/* 同步恢复：退出路径用，避免线程还没来得及跑就进程没了 */
+static void BrightRestoreNow(void)
+{
+    HRESULT hr;
+
+    if (!g_brightEvent || (LONG)g_brightApplied < 0) return;   /* 没压低过，无需恢复 */
+
+    InterlockedExchange(&g_brightStop, 1);
+    SetEvent(g_brightEvent);
+
+    EnterCriticalSection(&g_brightCs);
+    hr = CoInitializeEx(NULL, COINIT_MULTITHREADED);
+    if (SUCCEEDED(hr)) {
+        if (BrightConnect()) BrightApply(BRIGHT_RESTORE);
+        BrightDisconnect();
+        CoUninitialize();
+    }
+    LeaveCriticalSection(&g_brightCs);
+
+    if (g_brightThread) {
+        WaitForSingleObject(g_brightThread, 2000);
+        CloseHandle(g_brightThread);
+        g_brightThread = NULL;
+    }
+    CloseHandle(g_brightEvent);
+    g_brightEvent = NULL;
+    DeleteCriticalSection(&g_brightCs);
+}
+
 /* ---------------------------------------------------------------- 电源内核 */
 static DWORD WINAPI GuardThread(LPVOID)
 {
@@ -381,6 +751,7 @@ static void BlackShow(BOOL on)
         if (g_blackWnd) ShowWindow(g_blackWnd, SW_HIDE);
         if (InterlockedExchange(&g_blackOn, 0)) {
             SetCursor(LoadCursorW(NULL, IDC_ARROW));
+            BrightAsk(BRIGHT_RESTORE);
             LogMsg(L"black: overlay OFF");
         }
         return;
@@ -395,6 +766,7 @@ static void BlackShow(BOOL on)
     SetWindowPos(g_blackWnd, HWND_TOPMOST, 0, 0, 0, 0,
                  SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
     SetCursor(NULL);
+    BrightAsk(BRIGHT_MIN);
     LogMsg(L"black: overlay ON (virtual %d,%d %dx%d)",
            GetSystemMetrics(SM_XVIRTUALSCREEN),
            GetSystemMetrics(SM_YVIRTUALSCREEN),
@@ -521,6 +893,14 @@ static void LoadSettings()
         if (RegQueryValueExW(k, L"PrefMode", NULL, NULL, (BYTE *)&v, &sz) == ERROR_SUCCESS) {
             if (v == 1 || v == 2) g_prefMode = (int)v;
         }
+        sz = sizeof(v);
+        if (RegQueryValueExW(k, L"BlackBright", NULL, NULL, (BYTE *)&v, &sz) == ERROR_SUCCESS) {
+            if (v == 0 || v == 1) g_blackBright = (int)v;
+        }
+        sz = sizeof(v);
+        if (RegQueryValueExW(k, L"PeekSec", NULL, NULL, (BYTE *)&v, &sz) == ERROR_SUCCESS) {
+            if (v >= 1 && v <= 60) g_peekSec = (int)v;
+        }
         RegCloseKey(k);
     }
 }
@@ -535,6 +915,8 @@ static void SaveSettings()
     RegSetValueExW(k, L"ReblackSec", 0, REG_DWORD, (const BYTE *)&d, sizeof(d));
     d = (DWORD)g_prefMode;
     RegSetValueExW(k, L"PrefMode", 0, REG_DWORD, (const BYTE *)&d, sizeof(d));
+    d = (DWORD)g_blackBright;
+    RegSetValueExW(k, L"BlackBright", 0, REG_DWORD, (const BYTE *)&d, sizeof(d));
     RegCloseKey(k);
 }
 
@@ -798,6 +1180,7 @@ static void StopProtection()
     KillTimer(g_hwnd, TIMER_CLOCK);
     BlackShow(FALSE);
     UnregisterRawKeyboard();
+    g_peekUntil = 0;
 
     if (g_stopEvent) SetEvent(g_stopEvent);
     if (g_guardThread) {
@@ -821,6 +1204,24 @@ static void ToggleProtection()
 {
     if (g_mode == 0) StartProtection(g_prefMode == 2 ? 2 : 1);
     else             StopProtection();
+}
+
+/* 截屏型 agent 用的临时亮屏：撤掉遮罩 + 恢复背光 N 秒，到点自动再黑。
+ * 触发方式：AgentKeepAwake.exe --peek [秒]（第二个实例只发消息，不改电源状态） */
+static void StartPeek(int sec)
+{
+    if (sec < 1) sec = g_peekSec;
+    if (sec > 60) sec = 60;
+
+    if (g_mode != 1) {
+        LogMsg(L"peek: ignored (mode=%d, 只有黑屏守护需要亮屏)", (int)g_mode);
+        return;
+    }
+
+    g_peekUntil = GetTickCount() + (DWORD)sec * 1000;
+    BlackShow(FALSE);
+    MarkDirty();
+    LogMsg(L"peek: 亮屏 %d 秒（截屏窗口）", sec);
 }
 
 /* ---------------------------------------------------------------- 托盘 */
@@ -906,16 +1307,16 @@ static void BuildLayout()
     rMain     = RF(rHero.X + SCALE(18), rHero.Y + SCALE(152),
                    rHero.Width - SCALE(36), (float)SCALE(52));
     rAgents   = RF(pad, (float)SCALE(314), w, (float)SCALE(122));
-    rSettings = RF(pad, (float)SCALE(446), w, (float)SCALE(118));
+    rSettings = RF(pad, (float)SCALE(446), w, (float)SCALE(164));
 
     rBtnMin   = RF(pw - pad - SCALE(26) * 2 - SCALE(6), (float)SCALE(16),
                    (float)SCALE(26), (float)SCALE(26));
     rBtnClose = RF(pw - pad - SCALE(26), (float)SCALE(16),
                    (float)SCALE(26), (float)SCALE(26));
-    rBtnExit  = RF(pw - pad - SCALE(64), (float)SCALE(572),
+    rBtnExit  = RF(pw - pad - SCALE(64), (float)SCALE(618),
                    (float)SCALE(64), (float)SCALE(20));
 
-    /* 设置卡两行 */
+    /* 设置卡三行 */
     {
         float x = rSettings.X + SCALE(476 - 16) - SCALE(202);
         float y = rSettings.Y + SCALE(12);
@@ -923,14 +1324,23 @@ static void BuildLayout()
             rRb[i] = RF(x + i * (SCALE(46) + SCALE(6)), y, (float)SCALE(46), (float)SCALE(26));
 
         x = rSettings.X + SCALE(476 - 16) - SCALE(200);
-        y = rSettings.Y + SCALE(60);
+        y = rSettings.Y + SCALE(58);
         rMd[0] = RF(x, y, (float)SCALE(108), (float)SCALE(26));
         rMd[1] = RF(x + SCALE(108) + SCALE(8), y, (float)SCALE(84), (float)SCALE(26));
 
+        x = rSettings.X + SCALE(476 - 16) - SCALE(176);
+        y = rSettings.Y + SCALE(104);
+        rBr[0] = RF(x, y, (float)SCALE(84), (float)SCALE(26));
+        rBr[1] = RF(x + SCALE(84) + SCALE(8), y, (float)SCALE(84), (float)SCALE(26));
+
         rSettingsRow1 = RF(rSettings.X + SCALE(16), rSettings.Y + SCALE(12),
                            (float)SCALE(220), (float)SCALE(26));
-        rSettingsRow2 = RF(rSettings.X + SCALE(16), rSettings.Y + SCALE(60),
+        rSettingsRow2 = RF(rSettings.X + SCALE(16), rSettings.Y + SCALE(58),
                            (float)SCALE(220), (float)SCALE(26));
+        rSettingsRow3 = RF(rSettings.X + SCALE(16), rSettings.Y + SCALE(104),
+                           (float)SCALE(220), (float)SCALE(26));
+        rPeekHint = RF(rSettings.X + SCALE(16), rSettings.Y + SCALE(140),
+                       rSettings.Width - SCALE(32), (float)SCALE(14));
     }
 
     /* Agent 卡片 */
@@ -1582,8 +1992,11 @@ static void PaintFrame()
     /* ---------- 设置卡 ---------- */
     GlassCard(g, rSettings, (float)SCALE(20), 26);
     {
+        WCHAR hint[128];
+
         Txt(g, L"操作后自动再黑屏", fCardTitle, rSettingsRow1, C_TXT2, 0);
         Txt(g, L"守护模式", fCardTitle, rSettingsRow2, C_TXT2, 0);
+        Txt(g, L"黑屏时背光", fCardTitle, rSettingsRow3, C_TXT2, 0);
 
         static const WCHAR *labels[4] = { L"关", L"5 秒", L"15 秒", L"30 秒" };
         static const int vals[4] = { 0, 5, 15, 30 };
@@ -1592,11 +2005,21 @@ static void PaintFrame()
 
         DrawPill(g, rMd[0], g_prefMode == 1, g_hover[B_MD0], L"黑屏 + 防睡");
         DrawPill(g, rMd[1], g_prefMode == 2, g_hover[B_MD1], L"常亮防睡");
+
+        DrawPill(g, rBr[0], g_blackBright == 0, g_hover[B_BR0], L"跟随系统");
+        DrawPill(g, rBr[1], g_blackBright == 1, g_hover[B_BR1], L"压到最低");
+
+        if (g_brightAvail < 0)
+            lstrcpynW(hint, L"本机没有可调背光（外接屏/驱动不支持），只用纯黑遮罩", 128);
+        else
+            wsprintfW(hint, L"截屏型 agent：先运行 AgentKeepAwake.exe --peek %d，亮屏 %d 秒后自动再黑",
+                      g_peekSec, g_peekSec);
+        Txt(g, hint, fHint, rPeekHint, C_TXT4, 0);
     }
 
     /* ---------- 页脚 ---------- */
     Txt(g, L"Ctrl+Alt+K 一键开关 · 关闭窗口只收进托盘", fHint,
-        RF((float)SCALE(PAD), (float)SCALE(572), (float)SCALE(360), (float)SCALE(20)),
+        RF((float)SCALE(PAD), (float)SCALE(618), (float)SCALE(360), (float)SCALE(20)),
         C_TXT3, 0);
     Txt(g, L"退出程序", fFoot, rBtnExit,
         g_hover[B_EXIT] > 0.4f ? C_ROSE : C_TXT3, 2);
@@ -1642,6 +2065,8 @@ static int HitTest(int x, int y)
         if (rRb[i].Contains(p)) return B_RB0 + i;
     for (i = 0; i < 2; ++i)
         if (rMd[i].Contains(p)) return B_MD0 + i;
+    for (i = 0; i < 2; ++i)
+        if (rBr[i].Contains(p)) return B_BR0 + i;
 
     if (rMain.Contains(p))  return B_MAIN;
     if (rBtnMin.Contains(p))return B_MIN;
@@ -1675,6 +2100,18 @@ static void OnClick(int id)
     case B_RB3: g_reblackSec = 30; SaveSettings(); MarkDirty(); break;
     case B_MD0: g_prefMode = 1;    SaveSettings(); MarkDirty(); break;
     case B_MD1: g_prefMode = 2;    SaveSettings(); MarkDirty(); break;
+    case B_BR0:
+        g_blackBright = 0;
+        SaveSettings();
+        if (g_blackOn) BrightAsk(BRIGHT_RESTORE);   /* 关掉这档：立刻恢复亮度 */
+        MarkDirty();
+        break;
+    case B_BR1:
+        g_blackBright = 1;
+        SaveSettings();
+        if (g_blackOn) BrightAsk(BRIGHT_MIN);
+        MarkDirty();
+        break;
     default:
         break;
     }
@@ -1811,6 +2248,15 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
                     /* 刚盖上时留 1.5 秒防抖，避免启动时的合成输入误唤醒 */
                     if (GetTickCount() - g_blackAt >= 1500 && IdleMillis() < 1500)
                         BlackHideByInput(L"idle");
+                } else if (g_peekUntil) {
+                    /* peek 窗口结束就再黑；确实有人在用就交给空闲逻辑 */
+                    if ((LONG)(GetTickCount() - g_peekUntil) >= 0) {
+                        g_peekUntil = 0;
+                        if (IdleMillis() >= 1500) {
+                            LogMsg(L"peek: 结束 -> 黑屏");
+                            BlackShow(TRUE);
+                        }
+                    }
                 } else if (g_reblackSec > 0) {
                     DWORD idle = IdleMillis();
                     if (idle >= (DWORD)g_reblackSec * 1000) {
@@ -1865,6 +2311,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wp, LPARAM lp)
 
     case WM_AKA_SHOW:
         ShowMain();
+        return 0;
+
+    case WM_AKA_PEEK:
+        StartPeek((int)wp);
         return 0;
 
     case WM_SYSCOMMAND:
@@ -1927,6 +2377,7 @@ static void CleanupAndExit(HWND hwnd)
 
     BlackShow(FALSE);
     UnregisterRawKeyboard();
+    BrightRestoreNow();
     if (g_blackWnd) {
         DestroyWindow(g_blackWnd);
         g_blackWnd = NULL;
@@ -1950,10 +2401,33 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrev, LPWSTR cmd, int show)
     HANDLE mutex;
     int w, h, x, y;
 
-    (void)hPrev; (void)cmd;
+    (void)hPrev; (void)show;
 
     g_inst = hInstance;
     SetProcessDPIAware();
+
+    /* AgentKeepAwake.exe --peek [秒]：只给已运行的实例发消息，自己马上退出。
+     * 截屏型 agent 用它换一段“亮屏窗口”，期间不盖黑幕、不压背光。 */
+    if (cmd && *cmd) {
+        WCHAR *p = cmd, *q;
+        while (*p == L' ') ++p;
+        if (p[0] == L'-' && p[1] == L'-' &&
+            _wcsnicmp(p, L"--peek", 6) == 0) {
+            int sec = 0;
+            HWND old;
+            p += 6;
+            while (*p == L' ' || *p == L'=') ++p;
+            for (q = p; *q >= L'0' && *q <= L'9'; ++q) sec = sec * 10 + (*q - L'0');
+            old = FindWindowW(APP_CLASS, NULL);
+            if (old) {
+                PostMessageW(old, WM_AKA_PEEK, (WPARAM)sec, 0);
+                LogMsg(L"peek: requested from cli (%d s)", sec);
+            } else {
+                LogMsg(L"peek: 没有运行中的实例，先开始黑屏守护再用 --peek");
+            }
+            return 0;
+        }
+    }
 
     sdc = GetDC(NULL);
     g_dpi = (UINT)GetDeviceCaps(sdc, LOGPIXELSY);
@@ -1981,6 +2455,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE hPrev, LPWSTR cmd, int show)
 
     LoadSettings();
     LoadAgents();
+    BrightStart();
 
     ZeroMemory(&wc, sizeof(wc));
     wc.cbSize = sizeof(wc);
